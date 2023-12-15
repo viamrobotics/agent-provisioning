@@ -1,0 +1,12 @@
+{{define "scripts"}}{{end}}
+{{define "body"}}
+{{if ne (len .SSID) 0}}
+<div >
+  You provided credentials for <b>{{.SSID}}</b>
+</div>
+{{end}}
+
+<p>
+    <a href="/wifilist">Scan and connect to Wi-Fi Networks</a>
+</p>
+{{end}}
