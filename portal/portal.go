@@ -1,22 +1,18 @@
 package portal
 
 import (
-	"context"
 	"embed"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
-	"time"
-
-	"go.viam.com/utils"
 )
 
 const (
-	BindAddr = ":50052"
+	BindAddr = ":8888"
 )
 
 type CaptivePortal struct {
@@ -24,13 +20,14 @@ type CaptivePortal struct {
 
 	server *http.Server
 	visibleSSIDs []string
-	knownSSIDs []string
+	savedSSIDs []string
 	lastError error
 
 	ssid string
 	psk  string
 
 	inputRecieved atomic.Bool
+	workers sync.WaitGroup
 }
 
 type TemplateData struct{
@@ -44,50 +41,58 @@ type TemplateData struct{
 //go:embed templates/*
 var templates embed.FS
 
-func NewPortal(SSIDs, savedSSIDs []string, lastError error) *CaptivePortal {
+func NewPortal() *CaptivePortal {
 	mux := http.NewServeMux()
-	cp := &CaptivePortal{
-		server: &http.Server{Addr: BindAddr, Handler: mux},
-		visibleSSIDs: SSIDs,
-		knownSSIDs: savedSSIDs,
-	}
+	cp := &CaptivePortal{server: &http.Server{Addr: BindAddr, Handler: mux}}
 	mux.HandleFunc("/", cp.index)
-	mux.HandleFunc("/captive", cp.serveCaptive)
+	//mux.HandleFunc("/captive", cp.serveCaptive)
 	mux.HandleFunc("/wifilist", cp.getWifiList)
 	mux.HandleFunc("/save", cp.saveWifi)
 	return cp
 }
 
-func (cp *CaptivePortal) Run(ctx context.Context) error {
-
+func (cp *CaptivePortal) Run() {
+	cp.workers.Add(1)
 	go func() {
-		for {
-			if cp.inputRecieved.Load() {
-				utils.SelectContextOrWait(ctx, time.Second * 5)
-				break
-			}
-			if !utils.SelectContextOrWait(ctx, time.Second * 1) {
-				break
-			}
-		}
-		err := cp.Stop()
-		if err != nil {
+		defer cp.workers.Done()
+		err := cp.server.ListenAndServe()
+		if !errors.Is(err, http.ErrServerClosed) {
 			log.Println(err)
 		}
-		cp.inputRecieved.Store(false)
 	}()
-
-	return cp.server.ListenAndServe()
 }
 
 func (cp *CaptivePortal) Stop() error {
-	return cp.server.Close()
-}
-
-func (cp *CaptivePortal) GetSettings() (string, string, error) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
-	return cp.ssid, cp.psk, cp.lastError
+	err := cp.server.Close()
+	cp.ssid = ""
+	cp.psk = ""
+	cp.inputRecieved.Store(false)
+	return err
+}
+
+func (cp *CaptivePortal) GetUserInput() (string, string, bool) {
+	ok := cp.inputRecieved.Load()
+	if ok {
+		cp.mu.Lock()
+		defer cp.mu.Unlock()
+		ssid := cp.ssid
+		psk := cp.psk
+		cp.ssid = ""
+		cp.psk = ""
+		cp.inputRecieved.Store(false)
+		return ssid, psk, ok
+	}
+	return "", "", ok
+}
+
+func (cp *CaptivePortal) SetData(visibleSSIDs, savedSSIDs []string, lastError error) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	cp.visibleSSIDs = visibleSSIDs
+	cp.savedSSIDs = savedSSIDs
+	cp.lastError = lastError
 }
 
 func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +104,7 @@ func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 	data := TemplateData{
 		SSID: cp.ssid,
 		VisibleSSIDs: cp.visibleSSIDs,
-		KnownSSIDs: cp.knownSSIDs,
+		KnownSSIDs: cp.savedSSIDs,
 	}
 	if cp.lastError != nil {
 		data.LastError = cp.lastError.Error()
@@ -126,19 +131,23 @@ func (cp *CaptivePortal) getWifiList(w http.ResponseWriter, r *http.Request) {
 	data := TemplateData{
 		SSID: cp.ssid,
 		VisibleSSIDs: cp.visibleSSIDs,
-		KnownSSIDs: cp.knownSSIDs,
+		KnownSSIDs: cp.savedSSIDs,
 	}
 	if cp.lastError != nil {
 		data.LastError = cp.lastError.Error()
 	}
 	cp.mu.Unlock()
 
-	t, _ := template.ParseFS(templates, "templates/base.html", "templates/wifiform.html")
-	err := t.Execute(w, data)
-
+	t, err := template.ParseFS(templates, "templates/base.html", "templates/wifiform.html")
 	if err != nil {
 		fmt.Println(err)
-		panic(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	err = t.Execute(w, data)
+	if err != nil {
+		fmt.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
@@ -160,24 +169,22 @@ func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
 
 
 // Captive-portal magic for phones
-type CaptiveJson struct {
-	Captive       bool   `json:"captive"`
-	UserPortalUrl string `json:"user-portal-url"`
-}
+// type CaptiveJson struct {
+// 	Captive       bool   `json:"captive"`
+// 	UserPortalUrl string `json:"user-portal-url"`
+// }
 
-var captive CaptiveJson = CaptiveJson{
-	Captive:       true,
-	UserPortalUrl: "http://192.168.2.2/",
-}
+// func (cp *CaptivePortal) serveCaptive(w http.ResponseWriter, r *http.Request) {
+// 	defer r.Body.Close()
+// 	log.Printf(r.Host, r.URL.Path, r.Body, r.Header, r.Method)
+// 	j, err := json.Marshal(CaptiveJson{
+// 		Captive:       true,
+// 		UserPortalUrl: "http://192.168.2.2/",
+// 	})
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
 
-func (cp *CaptivePortal) serveCaptive(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	log.Printf(r.Host, r.URL.Path, r.Body, r.Header, r.Method)
-	j, err := json.Marshal(captive)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	w.Header().Set("Content-Type", "application/captive+json")
-	w.Write(j)
-}
+// 	w.Header().Set("Content-Type", "application/captive+json")
+// 	w.Write(j)
+// }
