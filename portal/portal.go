@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -17,6 +18,8 @@ const (
 
 type CaptivePortal struct {
 	mu sync.Mutex
+
+	lastInteraction time.Time
 
 	server *http.Server
 	visibleSSIDs []string
@@ -87,6 +90,12 @@ func (cp *CaptivePortal) GetUserInput() (string, string, bool) {
 	return "", "", ok
 }
 
+func (cp *CaptivePortal) GetLastInteraction() (time.Time) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.lastInteraction
+}
+
 func (cp *CaptivePortal) SetData(visibleSSIDs, savedSSIDs []string, lastError error) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
@@ -97,10 +106,10 @@ func (cp *CaptivePortal) SetData(visibleSSIDs, savedSSIDs []string, lastError er
 
 func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-
 	log.Printf(r.Host, r.URL.Path, r.Body, r.Header, r.Method)
 
 	cp.mu.Lock()
+	cp.lastInteraction = time.Now()
 	data := TemplateData{
 		SSID: cp.ssid,
 		VisibleSSIDs: cp.visibleSSIDs,
@@ -128,6 +137,7 @@ func (cp *CaptivePortal) getWifiList(w http.ResponseWriter, r *http.Request) {
 
 
 	cp.mu.Lock()
+	cp.lastInteraction = time.Now()
 	data := TemplateData{
 		SSID: cp.ssid,
 		VisibleSSIDs: cp.visibleSSIDs,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -34,8 +35,6 @@ var (
 
 
 func main() {
-
-	// SMURF TODO signaled context
 	ctx := setupExitSignalHandling()
 
 	nm, err := NewNMWrapper()
@@ -45,6 +44,11 @@ func main() {
 	defer nm.Close()
 
 	var prevError error
+
+	// initial scan
+	nm.WifiScan(ctx)
+
+	var settingsChan <-chan wifiSettings
 	for {
 		log.Debug("sleeping")
 		select {
@@ -62,33 +66,31 @@ func main() {
 		}
 
 		log.Debug("actual online: ", online)
-
-
 		// SMURF TESTING
 		online = false
-
 		if online {
+			nm.markSSIDsTried()
 			continue
 		}
 
 		// offline logic
-		bs, _ := nm.state.getBootstrap()
-		var settingsChan <-chan wifiSettings
-		// not in bootstrap mode, so start it
-		if !bs {
+		nm.WifiScan(ctx)
+		bs, bsTime := nm.state.getBootstrap()
+		// SMURF restore below
+		// _, _, lastOnline := nm.GetOnline()
+		// not in bootstrap mode, so start it, as long as we've been OUT of bootstrap for at least two minutes to try connections
+		if !bs && time.Now().After(bsTime.Add(time.Second)) { // SMURF 2 minutes && time.Now().After(lastOnline.Add(time.Minute * 2)) {
 			log.Debug("offline")
-			// SMURF restore below
-			// _, _, lastOnline := nm.GetOnline()
-			if true { // time.Now().After(lastOnline.Add(time.Minute * 2)) {
-				log.Debug("starting bootstrap")
-				settingsChan, err = nm.startBootstrap(prevError)
-				if err != nil {
-					log.Error(err)
-				}
-			} else {
-				// offline but not for long enough yet
-				continue
+			log.Debug("starting bootstrap")
+			settingsChan, err = nm.startBootstrap(prevError)
+			if err != nil {
+				log.Error(err)
 			}
+			bs = true
+		}
+
+		if !bs {
+			continue
 		}
 
 		// in bootstrap mode, wait for settings from user OR timeout
@@ -97,26 +99,40 @@ func main() {
 
 		log.Debugf("recv chan: %+v", settingsChan)
 
+		// will exit bootstrap after the select by default
+		shouldStopBS := true
 		select {
 		case settings := <-settingsChan:
-			log.Debug("settings recieved")
-			err := nm.AddOrUpdateConnection(settings.ssid, settings.psk)
-			if err != nil {
-				prevError = err
-				log.Error(err)
-				continue
+			// non-empty settings mean add a new network and exit bootstrap mode
+			if settings.ssid != "" && settings.psk != "" {
+				log.Debug("settings recieved")
+				err := nm.AddOrUpdateConnection(settings.ssid, settings.psk)
+				if err != nil {
+					prevError = err
+					log.Error(err)
+					continue
+				}
 			}
-
+			// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
+			if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
+				shouldStopBS = false
+			}
 		case <-ctx.Done():
-			log.Debug("context cancelled")
+			log.Debug("main context cancelled")
 		case <-time.After(10 * time.Minute):
+			// don't exit bootstrap mode if someone is active in the portal
+			if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
+				shouldStopBS = false
+			}
 			log.Debug("10 minute timeout")
 		}
-		log.Debug("bootstrap stopping")
 
-		err = nm.stopBootstrap()
-		if err != nil {
-			log.Error(err)
+		if shouldStopBS {
+			log.Debug("bootstrap stopping")
+			err = nm.stopBootstrap()
+			if err != nil {
+				log.Error(err)
+			}
 		}
 	}
 }
@@ -170,7 +186,6 @@ func (c *connectionState) getBootstrap() (bool, time.Time) {
 }
 
 type NMWrapper struct {
-
 	workers sync.WaitGroup
 
 	// only set during NewNMWrapper, no lock
@@ -189,7 +204,9 @@ type NMWrapper struct {
 	lastScanTime time.Time
 	visibleSSIDs []string
 	knownSSIDs map[string]gnm.Connection
+	triedSSIDs map[string]bool // union of knownSSIDs that have also been visible when NOT in provisioning mode
 	hotspotConn gnm.Connection
+	activeConn gnm.ActiveConnection
 }
 
 func NewNMWrapper() (*NMWrapper, error) {
@@ -203,7 +220,13 @@ func NewNMWrapper() (*NMWrapper, error) {
 		return nil, err
 	}
 
-	wrapper := &NMWrapper{nm: nm, settings: settings, state: &connectionState{}}
+	wrapper := &NMWrapper{
+		nm: nm,
+		settings: settings,
+		knownSSIDs: make(map[string]gnm.Connection),
+		triedSSIDs: make(map[string]bool),
+		state: &connectionState{bootstrapChange: time.Now()},
+	}
 
 	wrapper.hostname, err = settings.GetPropertyHostname()
 	if err != nil {
@@ -287,7 +310,6 @@ func (w *NMWrapper) initWifiDev() (error) {
 func (w *NMWrapper) updateKnownConnections() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.knownSSIDs = make(map[string]gnm.Connection)
 
 	conns, err := w.settings.ListConnections()
 	if err != nil {
@@ -449,28 +471,55 @@ func (w *NMWrapper) WifiScan(ctx context.Context) error {
 		return err
 	}
 
-	ssids := make([]string, len(wifiList))
-
-	for n, ap := range wifiList {
+	ssids := make(map[string]bool)
+	for _, ap := range wifiList {
 		ssid, err :=ap.GetPropertySSID()
 		if err != nil {
 			return err
 		}
-		ssids[n] = ssid
+		ssids[ssid] = true
+	}
+
+	var visibleSSIDs []string
+	for ssid, _ := range ssids {
+		visibleSSIDs = append(visibleSSIDs, ssid)
 	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.lastScanTime = time.Now()
-	w.visibleSSIDs = ssids
+	w.visibleSSIDs = visibleSSIDs
+
+	// mark ssids that are visible and known
+	for _, ssid := range visibleSSIDs {
+		_, ok := w.knownSSIDs[ssid]
+		if !ok {
+			continue
+		}
+		_, ok = w.triedSSIDs[ssid]
+		if !ok {
+			w.triedSSIDs[ssid] = false
+		}
+	}
+
 	return nil
 }
 
-
+func (w *NMWrapper) markSSIDsTried() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for k := range w.triedSSIDs {
+		w.triedSSIDs[k] = true
+	}
+}
 
 // bootstrap put the wifi in hotspot mode and starts a captive portal
 func (w *NMWrapper) startBootstrap(prevErr error) (<-chan wifiSettings, error){
 	log.Debug("startBootstrap 1")
+
+	// mark any SSIDs as already "tested" before we start scanning ourselves
+	w.markSSIDsTried()
+
 	w.mu.Lock()
 	log.Debug("startBootstrap 2")
 
@@ -480,6 +529,16 @@ func (w *NMWrapper) startBootstrap(prevErr error) (<-chan wifiSettings, error){
 		return nil, errors.New("bootstrap mode already started")
 	}
 	// SMURF TODO: setup wifi hotspot + iptables
+	activeConn, err := w.nm.ActivateConnection(w.hotspotConn, w.dev, nil)
+	if err != nil {
+		log.Error(err)
+	}
+	w.activeConn = activeConn
+
+	err = w.startIPTables()
+	if err != nil {
+		log.Error(err)
+	}
 
 	log.Debug("startBootstrap 3")
 
@@ -510,15 +569,15 @@ func (w *NMWrapper) startBootstrap(prevErr error) (<-chan wifiSettings, error){
 		log.Debug("bs loop 1")
 		defer w.workers.Done()
 		defer close(settingsChan)
+
 		for {
 			log.Debug("bs loop 2")
+			bs, _ := w.state.getBootstrap()
+			if !bs{
+				return
+			}
 			// loop waiting for input
 			w.mu.Lock()
-			if w.cp == nil {
-				log.Debug("bs loop 3")
-				w.mu.Unlock()
-				break
-			}
 			log.Debug("bs loop 4")
 			ssid, psk, ok := w.cp.GetUserInput()
 			if ok {
@@ -526,12 +585,20 @@ func (w *NMWrapper) startBootstrap(prevErr error) (<-chan wifiSettings, error){
 				log.Debugf("send chan: %+v", settingsChan)
 				settingsChan <- wifiSettings{ssid: ssid, psk: psk}
 				w.mu.Unlock()
-				break
+				continue
 			}
 			log.Debug("bs loop 6")
 			var knownSSIDs []string
 			for k := range w.knownSSIDs {
 				knownSSIDs = append(knownSSIDs, k)
+				tried, ok := w.triedSSIDs[k]
+				// if a new SSID has appeared that needs to be tried, we send blank credentials to let bootstrap mode exit
+				if ok && !tried {
+					settingsChan <- wifiSettings{}
+					w.mu.Unlock()
+					continue
+				}
+
 			}
 			log.Debug("bs loop 7")
 			w.cp.SetData(w.visibleSSIDs, knownSSIDs, prevErr)
@@ -559,9 +626,7 @@ func (w *NMWrapper) stopBootstrap() error {
 	err := w.cp.Stop()
 	w.cp = nil
 
-	// SMURF TODO: teardown wifi + iptables
-
-	return err
+	return errors.Join(err, w.stopIPTables(), w.nm.DeactivateConnection(w.activeConn))
 }
 
 
@@ -575,6 +640,15 @@ func (w *NMWrapper) Close() {
 		}
 	}
 	w.workers.Wait()
+}
+
+func (w *NMWrapper) GetLastInteraction() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.cp != nil {
+		return time.Time{}
+	}
+	return w.cp.GetLastInteraction()
 }
 
 func (w *NMWrapper) AddOrUpdateConnection(ssid, psk string) error {
@@ -591,6 +665,30 @@ func (w *NMWrapper) AddOrUpdateConnection(ssid, psk string) error {
 		w.knownSSIDs[ssid] = newConn
 	}
 	return newConn.Update(getSettingsWifi(connIDPrefix + ssid, ssid, psk))
+}
+
+func (w *NMWrapper) startIPTables() error {
+
+	// SMURF TODO get wlan0 and IP address from live system
+
+	cmd := exec.Command("bash", "-c", "iptables -t nat -A PREROUTING -p tcp -m tcp -i wlan0 --dport 80 -j DNAT --to-destination 10.42.0.1:8888")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Error(out)
+	}
+	return err
+}
+
+func (w *NMWrapper) stopIPTables() error {
+
+	// SMURF TODO get wlan0 and IP address from live system
+
+	cmd := exec.Command("bash", "-c", "iptables -t nat -D PREROUTING -p tcp -m tcp -i wlan0 --dport 80 -j DNAT --to-destination 10.42.0.1:8888")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Error(out)
+	}
+	return err
 }
 
 
