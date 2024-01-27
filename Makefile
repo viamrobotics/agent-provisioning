@@ -14,12 +14,10 @@ else
 PATH_VERSION = v$(TAG_VERSION)
 endif
 
-LDFLAGS = "-s -w" 
-#-X 'github.com/viamrobotics/agent/subsystems/viamagent.Version=${TAG_VERSION}' -X 'github.com/viamrobotics/agent/subsystems/viamagent.GitRevision=${GIT_REVISION}'"
+LDFLAGS = "-s -w -X 'github.com/viamrobotics/agent-provisioning/provisioning.Version=${TAG_VERSION}' -X 'github.com/viamrobotics/agent-provisioning/provisioning.GitRevision=${GIT_REVISION}'"
 TAGS = osusergo,netgo
 
-
-.DEFAULT_GOAL := bin/viam-agent-network-$(PATH_VERSION)-$(LINUX_ARCH)
+.DEFAULT_GOAL := bin/viam-agent-provisioning-$(PATH_VERSION)-$(LINUX_ARCH)
 
 .PHONY: all
 all: amd64 arm64
@@ -32,8 +30,8 @@ arm64:
 amd64:
 	make GOARCH=amd64
 
-bin/viam-agent-network-$(PATH_VERSION)-$(LINUX_ARCH): go.* *.go */*.go portal/templates/*
-	go build -o $@ -tags $(TAGS) -ldflags $(LDFLAGS) ./main.go
+bin/viam-agent-provisioning-$(PATH_VERSION)-$(LINUX_ARCH): go.* *.go */*.go */*/*.go portal/templates/*
+	go build -o $@ -tags $(TAGS) -ldflags $(LDFLAGS) ./cmd/viam-agent-provisioning/main.go
 	test "$(PATH_VERSION)" != "custom" && cp $@ bin/viam-agent-stable-$(LINUX_ARCH) || true
 
 .PHONY: clean
