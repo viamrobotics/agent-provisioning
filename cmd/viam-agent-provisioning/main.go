@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	errw "github.com/pkg/errors"
 	"github.com/edaniels/golog"
 	"github.com/jessevdk/go-flags"
 
@@ -28,6 +29,7 @@ func main() {
 
 	var opts struct {
 		Config  string `default:"/opt/viam/etc/agent-provisioning.json"              description:"Path to config file" long:"config" short:"c"`
+		AppConfig    string `default:"/etc/viam.json"              description:"Path to main viam cloud (app) config file" long:"app" short:"a"`
 		ProvisioningConfig    string `default:"/etc/viam-provisioning.json"              description:"Path to provisioning (customization) config file" long:"provisioning" short:"p"`
 		Debug   bool   `description:"Enable debug logging"    long:"debug"                      short:"d"`
 		Help    bool   `description:"Show this help message"  long:"help"                       short:"h"`
@@ -65,7 +67,7 @@ func main() {
 		log.Warn(err)
 	}
 
-	cfg, err := provisioning.LoadConfig(opts.ProvisioningConfig)
+	cfg, err := provisioning.LoadConfig(opts.Config)
 	if err != nil {
 		log.Warn(err)
 	}
@@ -81,9 +83,11 @@ func main() {
 	}
 	defer nm.Close()
 
-
 	for _, network := range cfg.Networks {
-		nm.AddOrUpdateConnection(network)
+		log.Debugf("adding/updating NetworkManager configuration for %s", network.SSID)
+		if err := nm.AddOrUpdateConnection(network); err != nil {
+			log.Error(errw.Wrapf(err, "error adding network %s", network.SSID))
+		}
 	}
 
 	// exact text is important, the parent process will watch for this line to indicate startup is successful
@@ -96,7 +100,6 @@ func main() {
 
 	var settingsChan <-chan netman.WifiSettings
 	for {
-		log.Debug("sleeping")
 		select {
 		case <-ctx.Done():
 			activeBackgroundWorkers.Wait()
@@ -104,16 +107,22 @@ func main() {
 		case <-time.After(time.Second * 15):
 		}
 
-		log.Debug("online check")
-
 		online, err := nm.CheckOnline()
 		if err != nil {
 			log.Error(err)
 		}
 
-		log.Debug("actual online: ", online)
 		if online {
 			nm.MarkSSIDsTried()
+		}
+
+		// check if we have a readable cloud config, if not, we need to bootstrap
+		_, err = os.ReadFile(opts.AppConfig)
+
+		configured := err == nil
+
+		log.Debugf("online: %t, config_present: %t", online, configured)
+		if online && configured {
 			continue
 		}
 
@@ -121,11 +130,10 @@ func main() {
 		nm.WifiScan(ctx)
 		bs, bsTime := nm.GetBootstrap()
 		 _, _, lastOnline := nm.GetOnline()
-		// not in bootstrap mode, so start it, as long as we've been OUT of bootstrap for at least two minutes to try connections
-		if !bs && time.Now().After(bsTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute * 2)) {
-			log.Debug("offline")
+		// not in bootstrap mode, so start it if not configure OR as long as we've been OUT of bootstrap for two minutes to try connections
+		if !bs && (!configured || time.Now().After(bsTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute * 2))) {
 			log.Debug("starting bootstrap")
-			settingsChan, err = nm.StartBootstrap(prevError)
+			settingsChan, err = nm.StartBootstrap(ctx, prevError)
 			if err != nil {
 				log.Error(err)
 			}
@@ -137,11 +145,9 @@ func main() {
 		}
 
 		// in bootstrap mode, wait for settings from user OR timeout
-
 		log.Debug("bootstrap waiting")
 
-		log.Debugf("recv chan: %+v", settingsChan)
-
+		var activateSSID string
 		// will exit bootstrap after the select by default
 		shouldStopBS := true
 		select {
@@ -160,6 +166,7 @@ func main() {
 					log.Error(err)
 					continue
 				}
+				activateSSID = settings.SSID
 			}
 			// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
 			if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
@@ -181,6 +188,10 @@ func main() {
 			if err != nil {
 				log.Error(err)
 			}
+		}
+		// force activating the SSID to save time (or if it was somehow manually disabled)
+		if activateSSID != "" {
+			nm.ActivateConnection(activateSSID)
 		}
 	}
 }
@@ -213,6 +224,10 @@ func setupExitSignalHandling() context.Context {
 			// ignore SIGURG entirely, it's used for real-time scheduling notifications
 			case syscall.SIGURG:
 
+			// used by parent viam-agent for healthchecks
+			case syscall.SIGUSR1:
+				fmt.Println("HEALTHY")
+
 			// log everything else
 			default:
 				log.Debugw("received unknown signal", "signal", sig)
@@ -220,7 +235,7 @@ func setupExitSignalHandling() context.Context {
 		}
 	}()
 
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGABRT)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGABRT, syscall.SIGUSR1)
 	return ctx
 }
 

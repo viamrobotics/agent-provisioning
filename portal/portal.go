@@ -3,24 +3,20 @@ package portal
 import (
 	"embed"
 	"errors"
-	"fmt"
 	"html/template"
-	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
-)
 
-const (
-	BindAddr = ":8888"
+	"go.uber.org/zap"
 )
 
 type CaptivePortal struct {
+	logger *zap.SugaredLogger
+
 	mu sync.Mutex
-
 	lastInteraction time.Time
-
 	server *http.Server
 	visibleSSIDs []string
 	savedSSIDs []string
@@ -44,12 +40,11 @@ type TemplateData struct{
 //go:embed templates/*
 var templates embed.FS
 
-func NewPortal() *CaptivePortal {
+func NewPortal(logger *zap.SugaredLogger, bindAddr string) *CaptivePortal {
 	mux := http.NewServeMux()
-	cp := &CaptivePortal{server: &http.Server{Addr: BindAddr, Handler: mux}}
+	cp := &CaptivePortal{logger: logger, server: &http.Server{Addr: bindAddr, Handler: mux}}
 	mux.HandleFunc("/", cp.index)
 	//mux.HandleFunc("/captive", cp.serveCaptive)
-	mux.HandleFunc("/wifilist", cp.getWifiList)
 	mux.HandleFunc("/save", cp.saveWifi)
 	return cp
 }
@@ -60,7 +55,7 @@ func (cp *CaptivePortal) Run() {
 		defer cp.workers.Done()
 		err := cp.server.ListenAndServe()
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Println(err)
+			cp.logger.Error(err)
 		}
 	}()
 }
@@ -106,8 +101,6 @@ func (cp *CaptivePortal) SetData(visibleSSIDs, savedSSIDs []string, lastError er
 
 func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	log.Printf(r.Host, r.URL.Path, r.Body, r.Header, r.Method)
-
 	cp.mu.Lock()
 	cp.lastInteraction = time.Now()
 	data := TemplateData{
@@ -118,59 +111,29 @@ func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 	if cp.lastError != nil {
 		data.LastError = cp.lastError.Error()
 	}
-
 	cp.mu.Unlock()
+
 	t, err := template.ParseFS(templates, "templates/base.html", "templates/index.html")
 	if err != nil {
-		panic(err)
-	}
-	err = t.Execute(w, data)
-	if err != nil {
-		panic(err)
-	}
-}
-
-
-func (cp *CaptivePortal) getWifiList(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	log.Printf(r.Host, r.URL.Path, r.Body, r.Header, r.Method)
-
-
-	cp.mu.Lock()
-	cp.lastInteraction = time.Now()
-	data := TemplateData{
-		SSID: cp.ssid,
-		VisibleSSIDs: cp.visibleSSIDs,
-		KnownSSIDs: cp.savedSSIDs,
-	}
-	if cp.lastError != nil {
-		data.LastError = cp.lastError.Error()
-	}
-	cp.mu.Unlock()
-
-	t, err := template.ParseFS(templates, "templates/base.html", "templates/wifiform.html")
-	if err != nil {
-		fmt.Println(err)
+		cp.logger.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
 	err = t.Execute(w, data)
 	if err != nil {
-		fmt.Println(err)
+		cp.logger.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
 func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	log.Printf(r.Host, r.URL.Path, r.Body, r.Header, r.Method)
-
 	if r.Method == "POST" {
 		cp.mu.Lock()
 		defer cp.mu.Unlock()
 		cp.ssid = r.FormValue("ssid")
 		cp.psk = r.FormValue("password")
-		log.Printf("saving credentials for %s", cp.ssid)
+		cp.logger.Debugf("saving credentials for %s", cp.ssid)
 		cp.inputRecieved.Store(true)
 	}
 

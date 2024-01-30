@@ -1,11 +1,13 @@
 package networkmanager
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os/exec"
+	"io/fs"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,18 @@ import (
 	provisioning "github.com/viamrobotics/agent-provisioning"
 	"github.com/viamrobotics/agent-provisioning/portal"
 )
+
+const (
+	DnsMasqFilepath = "/etc/NetworkManager/dnsmasq-shared.d/10-viam.com"
+	DnsMasqContents = "address=/#/10.42.0.1"
+)
+
+var (
+	BindAddr = "10.42.0.1:80"
+	// older networkmanager requires unit32 arrays for IP addresses.
+	ipAsUint32 = binary.LittleEndian.Uint32([]byte{10, 42, 0, 1})
+)
+
 
 type NMWrapper struct {
 	workers sync.WaitGroup
@@ -127,7 +141,7 @@ func (w *NMWrapper) CheckOnline() (bool, error) {
 }
 
 
-func (w *NMWrapper) initWifiDev() (error) {
+func (w *NMWrapper) initWifiDev() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	devices, err := w.nm.GetDevices()
@@ -261,18 +275,12 @@ func (w *NMWrapper) getSettingsWifi(id, ssid, psk string, priority int) (gnm.Con
 }
 
 func (w *NMWrapper) getSettingsHotspot(id, ssid, psk string) (gnm.ConnectionSettings) {
-
-	// SMURF TODO write /etc/NetworkManager/dnsmasq-shared.d/10-viam.conf:
-	// address=/#/10.42.0.1
-
-	// older networkmanager requires unit32 arrays for IP addresses.
-	ipAsUint32 := binary.LittleEndian.Uint32([]byte{10, 42, 0, 1})
-
 	settings := gnm.ConnectionSettings{
 		"connection": map[string]interface{}{
 			"id": id,
 			"uuid": uuid.New().String(),
 			"type": "802-11-wireless",
+			"autoconnect": false,
 		},
 		"802-11-wireless": map[string]interface{}{
 			"mode": "ap",
@@ -367,7 +375,7 @@ func (w *NMWrapper) MarkSSIDsTried() {
 }
 
 // bootstrap put the wifi in hotspot mode and starts a captive portal
-func (w *NMWrapper) StartBootstrap(prevErr error) (<-chan WifiSettings, error){
+func (w *NMWrapper) StartBootstrap(ctx context.Context, prevErr error) (<-chan WifiSettings, error){
 	w.logger.Debug("startBootstrap 1")
 
 	// mark any SSIDs as already "tested" before we start scanning ourselves
@@ -382,24 +390,44 @@ func (w *NMWrapper) StartBootstrap(prevErr error) (<-chan WifiSettings, error){
 		return nil, errors.New("bootstrap mode already started")
 	}
 
+	if err := w.writeDnsMasq(); err != nil{
+		return nil, (errw.Wrap(err, "error writing dnsmasq configuration during bootstrap startup"))
+	}
+
 	activeConn, err := w.nm.ActivateConnection(w.hotspotConn, w.dev, nil)
 	if err != nil {
 		w.logger.Error(err)
 	}
 	w.activeConn = activeConn
 
-	err = w.startIPTables()
-	if err != nil {
-		w.logger.Error(err)
+	w.logger.Debug("startBootstrap 3")
+	w.state.setBootstrap(true)
+
+	var hotspotActive bool
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second * 30)
+	defer cancel()
+	for {
+		state, err := w.activeConn.GetPropertyState()
+		if err != nil {
+			w.logger.Error(err)
+		}
+		if state == gnm.NmActiveConnectionStateActivated {
+			hotspotActive = true
+			break
+		}
+		if timeoutCtx.Err() != nil {
+			break
+		}
 	}
 
-	w.logger.Debug("startBootstrap 3")
+	if !hotspotActive {
+		return nil, errors.New("could not activate provisioning hotspot")
+	}
 
 	// start portal with ssid list and known connections
-	w.cp = portal.NewPortal()
+	w.cp = portal.NewPortal(w.logger, BindAddr)
 	w.cp.Run()
 	w.logger.Debug("startBootstrap 4")
-	w.state.setBootstrap(true)
 	w.mu.Unlock()
 	w.logger.Debug("startBootstrap 5")
 
@@ -479,7 +507,6 @@ func (w *NMWrapper) StopBootstrap() error {
 	err := w.cp.Stop()
 	w.cp = nil
 
-	err = errors.Join(err, w.stopIPTables())
 	if w.activeConn != nil {
 		err = errors.Join(err, w.nm.DeactivateConnection(w.activeConn))
 	}
@@ -508,6 +535,17 @@ func (w *NMWrapper) GetLastInteraction() time.Time {
 	return w.cp.GetLastInteraction()
 }
 
+func (w *NMWrapper) ActivateConnection(ssid string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	conSettings, ok := w.knownSSIDs[ssid]
+	if !ok {
+		return errw.Errorf("no settings found for ssid: %s", ssid)
+	}
+	_, err := w.nm.ActivateConnection(conSettings, w.dev, nil)
+	return err
+}
+
 func (w *NMWrapper) AddOrUpdateConnection(cfg provisioning.NetworkConfig) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -530,28 +568,17 @@ func (w *NMWrapper) AddOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 	return newConn.Update(settings)
 }
 
-func (w *NMWrapper) startIPTables() error {
-
-	// SMURF TODO get wlan0 and IP address from live system
-
-	cmd := exec.Command("bash", "-c", "iptables -t nat -A PREROUTING -p tcp -m tcp -i wlan0 --dport 80 -j DNAT --to-destination 10.42.0.1:8888")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		w.logger.Error(out)
+func (w *NMWrapper) writeDnsMasq() error {
+	fileBytes, err := os.ReadFile(DnsMasqFilepath)
+	if err == nil && bytes.Equal(fileBytes, []byte(DnsMasqContents)){
+		return nil
 	}
-	return err
-}
 
-func (w *NMWrapper) stopIPTables() error {
-
-	// SMURF TODO get wlan0 and IP address from live system
-
-	cmd := exec.Command("bash", "-c", "iptables -t nat -D PREROUTING -p tcp -m tcp -i wlan0 --dport 80 -j DNAT --to-destination 10.42.0.1:8888")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		w.logger.Error(out)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
-	return err
+
+	return os.WriteFile(DnsMasqFilepath, []byte(DnsMasqContents), 0644)
 }
 
 type connectionState struct {
