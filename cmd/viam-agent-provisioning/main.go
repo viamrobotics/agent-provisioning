@@ -2,20 +2,21 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	errw "github.com/pkg/errors"
 	"github.com/edaniels/golog"
 	"github.com/jessevdk/go-flags"
+	errw "github.com/pkg/errors"
 
-	netman "github.com/viamrobotics/agent-provisioning/networkmanager"
 	"github.com/viamrobotics/agent-provisioning"
+	netman "github.com/viamrobotics/agent-provisioning/networkmanager"
 )
 
 var (
@@ -60,8 +61,6 @@ func main() {
 		log = golog.NewDebugLogger("agent-provisioning")
 	}
 
-
-
 	pCfg, err := provisioning.LoadProvisioningConfig(opts.ProvisioningConfig)
 	if err != nil {
 		log.Warn(err)
@@ -79,7 +78,8 @@ func main() {
 
 	nm, err := netman.NewNMWrapper(log, pCfg)
 	if err != nil {
-		log.Fatal(err)
+		log.Error(err)
+		return
 	}
 	defer nm.Close()
 
@@ -96,15 +96,15 @@ func main() {
 	var prevError error
 
 	// initial scan
-	nm.WifiScan(ctx)
+	if err := nm.WifiScan(ctx); err != nil {
+		log.Error(err)
+	}
 
 	var settingsChan <-chan netman.WifiSettings
 	for {
-		select {
-		case <-ctx.Done():
-			activeBackgroundWorkers.Wait()
-			return
-		case <-time.After(time.Second * 15):
+		if !provisioning.HealthySleep(ctx, time.Second * 15) {
+				activeBackgroundWorkers.Wait()
+				return
 		}
 
 		online, err := nm.CheckOnline()
@@ -116,43 +116,50 @@ func main() {
 			nm.MarkSSIDsTried()
 		}
 
-		// check if we have a readable cloud config, if not, we need to bootstrap
+		// check if we have a readable cloud config, if not, we need to enter provisioning mode
 		_, err = os.ReadFile(opts.AppConfig)
 
 		configured := err == nil
 
 		log.Debugf("online: %t, config_present: %t", online, configured)
+
+		// restart the loop if everything is good
 		if online && configured {
 			continue
 		}
 
-		// offline logic
-		nm.WifiScan(ctx)
-		bs, bsTime := nm.GetBootstrap()
+		// provisioning mode logic starts here for when not online and configured
+		if err := nm.WifiScan(ctx); err != nil {
+			log.Error(err)
+		}
+		provisioningMode, provisioningTime := nm.GetProvisioning()
 		 _, _, lastOnline := nm.GetOnline()
-		// not in bootstrap mode, so start it if not configure OR as long as we've been OUT of bootstrap for two minutes to try connections
-		if !bs && (!configured || time.Now().After(bsTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute * 2))) {
-			log.Debug("starting bootstrap")
-			settingsChan, err = nm.StartBootstrap(ctx, prevError)
+		// not in provisioning mode, so start it if not configured (/etc/viam.json)
+		// OR as long as we've been OUT of provisioning for two minutes to try connections
+		if !provisioningMode && 
+			(!configured || time.Now().After(provisioningTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute * 2))) {
+			log.Debug("starting provisioning mode")
+			settingsChan, err = nm.StartProvisioning(ctx, prevError)
 			if err != nil {
-				log.Error(err)
+				log.Error(errw.Wrap(err, "error starting provisioning mode"))
+				continue
 			}
-			bs = true
+			provisioningMode = true
 		}
 
-		if !bs {
+		if !provisioningMode {
 			continue
 		}
 
-		// in bootstrap mode, wait for settings from user OR timeout
-		log.Debug("bootstrap waiting")
+		// in provisioning mode, wait for settings from user OR timeout
+		log.Debug("provisioning mode ready, waiting for user input")
 
 		var activateSSID string
-		// will exit bootstrap after the select by default
-		shouldStopBS := true
+		// will exit provisioning after the select by default
+		shouldStopProvisioning := true
 		select {
 		case settings := <-settingsChan:
-			// non-empty settings mean add a new network and exit bootstrap mode
+			// non-empty settings mean add a new network and exit provisioning mode
 			if settings.SSID != "" && settings.PSK != "" {
 				log.Debug("settings recieved")
 				err := nm.AddOrUpdateConnection(provisioning.NetworkConfig{
@@ -170,28 +177,31 @@ func main() {
 			}
 			// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
 			if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
-				shouldStopBS = false
+				shouldStopProvisioning = false
 			}
 		case <-ctx.Done():
 			log.Debug("main context cancelled")
 		case <-time.After(10 * time.Minute):
-			// don't exit bootstrap mode if someone is active in the portal
+			// don't exit provisioning mode if someone is active in the portal
 			if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
-				shouldStopBS = false
+				shouldStopProvisioning = false
 			}
 			log.Debug("10 minute timeout")
 		}
 
-		if shouldStopBS {
-			log.Debug("bootstrap stopping")
-			err = nm.StopBootstrap()
+		if shouldStopProvisioning {
+			log.Debug("provisioning mode stopping")
+			err = nm.StopProvisioning()
 			if err != nil {
 				log.Error(err)
 			}
 		}
 		// force activating the SSID to save time (or if it was somehow manually disabled)
 		if activateSSID != "" {
-			nm.ActivateConnection(activateSSID)
+			if err := nm.ActivateConnection(activateSSID); err != nil {
+				prevError = err
+				log.Error(err)
+			}
 		}
 	}
 }
@@ -199,6 +209,10 @@ func main() {
 func setupExitSignalHandling() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	sigChan := make(chan os.Signal, 16)
+
+	healthcheckRequest := &atomic.Bool{}
+	ctx = context.WithValue(ctx, provisioning.HCReqKey, healthcheckRequest)
+
 	activeBackgroundWorkers.Add(1)
 	go func() {
 		defer activeBackgroundWorkers.Done()
@@ -226,7 +240,7 @@ func setupExitSignalHandling() context.Context {
 
 			// used by parent viam-agent for healthchecks
 			case syscall.SIGUSR1:
-				fmt.Println("HEALTHY")
+				healthcheckRequest.Store(true)
 
 			// log everything else
 			default:

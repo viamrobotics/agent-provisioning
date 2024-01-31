@@ -24,8 +24,11 @@ import (
 )
 
 const (
-	DnsMasqFilepath = "/etc/NetworkManager/dnsmasq-shared.d/10-viam.com"
-	DnsMasqContents = "address=/#/10.42.0.1"
+	DnsMasqFilepath = "/etc/NetworkManager/dnsmasq-shared.d/80-viam.conf"
+	DnsMasqContents = "address=/#/10.42.0.1\n"
+
+	ConnCheckFilepath = "/etc/NetworkManager/conf.d/80-viam.conf"
+	ConnCheckContents = "[connectivity]\nuri=http://packages.viam.com/check_network_status.txt\ninterval=300\n"
 )
 
 var (
@@ -52,7 +55,6 @@ type NMWrapper struct {
 
 	// requires locking
 	mu sync.Mutex
-	lastOnlineTime time.Time
 	lastScanTime time.Time
 	visibleSSIDs []string
 	knownSSIDs map[string]gnm.Connection
@@ -79,12 +81,12 @@ func NewNMWrapper(logger *zap.SugaredLogger, pCfg *provisioning.ProvisioningConf
 		settings: settings,
 		knownSSIDs: make(map[string]gnm.Connection),
 		triedSSIDs: make(map[string]bool),
-		state: &connectionState{bootstrapChange: time.Now()},
+		state: &connectionState{provisioningChange: time.Now()},
 	}
 
 	wrapper.hostname, err = settings.GetPropertyHostname()
 	if err != nil {
-		return nil, err
+		return nil, errw.Wrap(err, "error getting hostname from NetworkManager, is NetworkManager installed and enabled?")
 	}
 
 	err = wrapper.initWifiDev()
@@ -97,6 +99,46 @@ func NewNMWrapper(logger *zap.SugaredLogger, pCfg *provisioning.ProvisioningConf
 		return nil, err
 	}
 
+
+
+	connCheckEnabled, err := wrapper.nm.GetPropertyConnectivityCheckEnabled()
+	if err != nil {
+		return nil, (errw.Wrap(err, "error getting NetworkManager connectivity check state"))
+	}
+
+	if !connCheckEnabled {
+		hasConnCheck, err := wrapper.nm.GetPropertyConnectivityCheckAvailable()
+		if err != nil {
+			return nil, (errw.Wrap(err, "error getting NetworkManager connectivity check configuration"))
+		}
+
+		if !hasConnCheck {
+			if err := wrapper.writeConnCheck(); err != nil{
+				return nil, (errw.Wrap(err, "error writing NetworkManager connectivity check configuration"))
+			}
+			if err := wrapper.nm.Reload(0); err != nil {
+				return nil, (errw.Wrap(err, "error reloading NetworkManager"))
+			}
+
+			hasConnCheck, err = wrapper.nm.GetPropertyConnectivityCheckAvailable()
+			if err != nil {
+				return nil, (errw.Wrap(err, "error getting NetworkManager connectivity check configuration"))
+			}
+			if !hasConnCheck {
+				return nil, (errors.New("error configuring NetworkManager connectivity check"))
+			}
+		}
+
+		connCheckEnabled, err = wrapper.nm.GetPropertyConnectivityCheckEnabled()
+		if err != nil {
+			return nil, (errw.Wrap(err, "error getting NetworkManager connectivity check state"))
+		}
+
+		if !connCheckEnabled {
+			return nil, errors.New("NetworkManager connectivity checking disabled by user, network management will be unavailable")
+		}
+	}
+
 	return wrapper, nil
 }
 
@@ -104,8 +146,8 @@ func (w *NMWrapper) GetOnline() (bool, time.Time, time.Time) {
 	return w.state.getOnline()
 }
 
-func (w *NMWrapper) GetBootstrap() (bool, time.Time) {
-	return w.state.getBootstrap()
+func (w *NMWrapper) GetProvisioning() (bool, time.Time) {
+	return w.state.getProvisioning()
 }
 
 func (w *NMWrapper) CheckOnline() (bool, error) {
@@ -158,7 +200,7 @@ func (w *NMWrapper) initWifiDev() error {
 			wifiDev, ok := device.(gnm.DeviceWireless)
 			if ok {
 				w.dev = wifiDev
-				return nil
+				return w.dev.SetPropertyAutoConnect(true)
 			}
 		}
 	}
@@ -304,39 +346,40 @@ func (w *NMWrapper) getSettingsHotspot(id, ssid, psk string) (gnm.ConnectionSett
 func (w *NMWrapper) WifiScan(ctx context.Context) error {
 	prevScan, err := w.dev.GetPropertyLastScan()
 	if err != nil {
-		return err
+		return errw.Wrap(err, "error scanning wifi")
 	}
 
 	err = w.dev.RequestScan()
 	if err != nil {
-		return err
+		return errw.Wrap(err, "error scanning wifi")
 	}
 
 	var lastScan int64
 	for {
 		lastScan, err = w.dev.GetPropertyLastScan()
 		if err != nil {
-			return err
+			return errw.Wrap(err, "error scanning wifi")
 		}
 		if lastScan > prevScan {
 			break
 		}
-		if ctx.Err() != nil {
-			return ctx.Err()
+		select {
+		case <-ctx.Done():
+			return errw.Wrap(ctx.Err(), "error scanning wifi")
+		case <-time.After(time.Second):
 		}
-		time.Sleep(time.Second)
 	}
 
 	wifiList, err := w.dev.GetAccessPoints()
 	if err != nil {
-		return err
+		return errw.Wrap(err, "error scanning wifi")
 	}
 
 	ssids := make(map[string]bool)
 	for _, ap := range wifiList {
 		ssid, err :=ap.GetPropertySSID()
 		if err != nil {
-			return err
+			return errw.Wrap(err, "error scanning wifi")
 		}
 		ssids[ssid] = true
 	}
@@ -374,34 +417,31 @@ func (w *NMWrapper) MarkSSIDsTried() {
 	}
 }
 
-// bootstrap put the wifi in hotspot mode and starts a captive portal
-func (w *NMWrapper) StartBootstrap(ctx context.Context, prevErr error) (<-chan WifiSettings, error){
-	w.logger.Debug("startBootstrap 1")
-
+// StartProvisioning puts the wifi in hotspot mode and starts a captive portal
+func (w *NMWrapper) StartProvisioning(ctx context.Context, prevErr error) (<-chan WifiSettings, error){
 	// mark any SSIDs as already "tested" before we start scanning ourselves
 	w.MarkSSIDsTried()
 
 	w.mu.Lock()
-	w.logger.Debug("startBootstrap 2")
-
-	bs, _ := w.state.getBootstrap()
-	if bs {
+	provisioningMode, _ := w.state.getProvisioning()
+	if provisioningMode {
 		w.mu.Unlock()
-		return nil, errors.New("bootstrap mode already started")
+		return nil, errors.New("provisioning mode already started")
 	}
 
 	if err := w.writeDnsMasq(); err != nil{
-		return nil, (errw.Wrap(err, "error writing dnsmasq configuration during bootstrap startup"))
+		w.mu.Unlock()
+		return nil, (errw.Wrap(err, "error writing dnsmasq configuration during provisioning mode startup"))
 	}
 
 	activeConn, err := w.nm.ActivateConnection(w.hotspotConn, w.dev, nil)
 	if err != nil {
-		w.logger.Error(err)
+		w.mu.Unlock()
+		return nil, errw.Wrap(err, "error activating hotspot")
 	}
 	w.activeConn = activeConn
 
-	w.logger.Debug("startBootstrap 3")
-	w.state.setBootstrap(true)
+	w.state.setProvisioning(true)
 
 	var hotspotActive bool
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second * 30)
@@ -421,59 +461,59 @@ func (w *NMWrapper) StartBootstrap(ctx context.Context, prevErr error) (<-chan W
 	}
 
 	if !hotspotActive {
+		w.mu.Unlock()
 		return nil, errors.New("could not activate provisioning hotspot")
 	}
 
 	// start portal with ssid list and known connections
 	w.cp = portal.NewPortal(w.logger, BindAddr)
 	w.cp.Run()
-	w.logger.Debug("startBootstrap 4")
 	w.mu.Unlock()
-	w.logger.Debug("startBootstrap 5")
 
 	w.workers.Add(1)
 	go func(){
 		defer w.workers.Done()
 		for {
-			bs, _ := w.state.getBootstrap()
-			if !bs{
+			provisioningMode, _ := w.state.getProvisioning()
+			if !provisioningMode{
 				return
 			}
-			w.WifiScan(context.TODO())
-			time.Sleep(time.Second * 15)
+			err := w.WifiScan(ctx)
+			if err != nil {
+				w.logger.Error(err)
+			}
+			select{
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second * 15):
+			}
 		}
 	}()
 
 	settingsChan := make(chan WifiSettings)
 	w.workers.Add(1)
 	go func() {
-		//w.logger.Debug("bs loop 1")
 		defer w.workers.Done()
 		defer close(settingsChan)
 
 		for {
-			//w.logger.Debug("bs loop 2")
-			bs, _ := w.state.getBootstrap()
-			if !bs{
+			provisioningMode, _ := w.state.getProvisioning()
+			if !provisioningMode{
 				return
 			}
 			// loop waiting for input
 			w.mu.Lock()
-			//w.logger.Debug("bs loop 4")
 			ssid, psk, ok := w.cp.GetUserInput()
 			if ok {
-			//	w.logger.Debug("bs loop 5")
-				w.logger.Debugf("send chan: %+v", settingsChan)
 				settingsChan <- WifiSettings{SSID: ssid, PSK: psk}
 				w.mu.Unlock()
 				continue
 			}
-			//w.logger.Debug("bs loop 6")
 			var knownSSIDs []string
 			for k := range w.knownSSIDs {
 				knownSSIDs = append(knownSSIDs, k)
 				tried, ok := w.triedSSIDs[k]
-				// if a new SSID has appeared that needs to be tried, we send blank credentials to let bootstrap mode exit
+				// if a new SSID has appeared that needs to be tried, we send blank credentials to let provisioning mode exit
 				if ok && !tried {
 					settingsChan <- WifiSettings{}
 					w.mu.Unlock()
@@ -481,29 +521,28 @@ func (w *NMWrapper) StartBootstrap(ctx context.Context, prevErr error) (<-chan W
 				}
 
 			}
-			//w.logger.Debug("bs loop 7")
 			w.cp.SetData(w.visibleSSIDs, knownSSIDs, prevErr)
 
 			// end loop
 			w.mu.Unlock()
-			//w.logger.Debug("bs loop 8")
-			time.Sleep(time.Second)
+			if !provisioning.HealthySleep(ctx, time.Second){
+				break
+			}
 		}
 	}()
-	w.logger.Debug("startBootstrap 6")
 
 	return settingsChan, nil
 }
 
 
-func (w *NMWrapper) StopBootstrap() error {
-	bs, _ := w.state.getBootstrap()
-	if !bs {
-		return errors.New("bootstrap mode not yet started")
+func (w *NMWrapper) StopProvisioning() error {
+	provisioningMode, _ := w.state.getProvisioning()
+	if !provisioningMode {
+		return errors.New("provisioning mode not yet started")
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.state.setBootstrap(false)
+	w.state.setProvisioning(false)
 	err := w.cp.Stop()
 	w.cp = nil
 
@@ -515,10 +554,10 @@ func (w *NMWrapper) StopBootstrap() error {
 
 
 func (w *NMWrapper) Close() {
-	bs, _ := w.state.getBootstrap()
+	provisioningMode, _ := w.state.getProvisioning()
 
-	if bs {
-		err := w.StopBootstrap()
+	if provisioningMode {
+		err := w.StopProvisioning()
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -581,6 +620,19 @@ func (w *NMWrapper) writeDnsMasq() error {
 	return os.WriteFile(DnsMasqFilepath, []byte(DnsMasqContents), 0644)
 }
 
+func (w *NMWrapper) writeConnCheck() error {
+	fileBytes, err := os.ReadFile(ConnCheckFilepath)
+	if err == nil && bytes.Equal(fileBytes, []byte(ConnCheckContents)){
+		return nil
+	}
+
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	return os.WriteFile(ConnCheckFilepath, []byte(ConnCheckContents), 0644)
+}
+
 type connectionState struct {
 	mu sync.Mutex
 
@@ -588,8 +640,8 @@ type connectionState struct {
 	onlineChange time.Time
 	lastOnline time.Time
 
-	bootstrapMode bool
-	bootstrapChange time.Time
+	provisioningMode bool
+	provisioningChange time.Time
 }
 
 func (c *connectionState) setOnline(online bool) {
@@ -609,18 +661,18 @@ func (c *connectionState) getOnline() (bool, time.Time, time.Time) {
 	return c.online, c.onlineChange, c.lastOnline
 }
 
-func (c *connectionState) setBootstrap(mode bool) {
+func (c *connectionState) setProvisioning(mode bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	c.bootstrapMode = mode
-	c.bootstrapChange = now
+	c.provisioningMode = mode
+	c.provisioningChange = now
 }
 
-func (c *connectionState) getBootstrap() (bool, time.Time) {
+func (c *connectionState) getProvisioning() (bool, time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.bootstrapMode, c.bootstrapChange
+	return c.provisioningMode, c.provisioningChange
 }
 
 type WifiSettings struct {

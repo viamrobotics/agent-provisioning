@@ -1,10 +1,14 @@
 package provisioning
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"sync/atomic"
+	"time"
 )
 
 var (
@@ -92,4 +96,43 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	return newConfig, nil
+}
+
+type ContextKey string
+const HCReqKey = ContextKey("healthcheck")
+
+func HealthySleep(ctx context.Context, timeout time.Duration) bool {
+	hc, ok := ctx.Value(HCReqKey).(*atomic.Bool)
+	if !ok {
+		// this should never happen, so avoiding having to pass a logger by just printing
+		fmt.Println("context passed to HealthySleep without healthcheck value")
+	}
+
+	stop := &atomic.Bool{}
+	defer stop.Store(true)
+
+	go func() {
+		for {
+			if hc.Swap(false) {
+				fmt.Println("HEALTHY")
+			}
+			if stop.Load() {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(timeout):
+			return true
+		}
+	}
 }
