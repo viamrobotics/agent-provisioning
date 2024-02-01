@@ -22,14 +22,16 @@
       {{if eq (len .VisibleSSIDs) 0}}
         <input type="text" name="ssid" placeholder="enter Wifi SSID" id="network" required>
       {{else}}
-        <select name="ssid" id="network" required>
-          <option value="">--Please choose an option--</option>
-          {{range .VisibleSSIDs}}
-            {{if ne (len .) 0}}
-              <option value="{{.}}">{{.}}</option>
+        <div class="select-border">
+          <select name="ssid" id="network" required>
+            <option value="">--Please choose an option--</option>
+            {{range .VisibleSSIDs}}
+              {{if ne (len .) 0}}
+                <option value="{{.}}">{{.}}</option>
+              {{end}}
             {{end}}
-          {{end}}
-        </select>
+          </select>
+        </div>
       {{end}}
     </div>
 
