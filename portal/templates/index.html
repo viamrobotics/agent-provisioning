@@ -1,0 +1,45 @@
+{{define "scripts"}}{{end}}
+{{define "body"}}
+
+<div class="container">
+  {{if eq (len .VisibleSSIDs) 0}}
+  <div >
+    <span class="closebtn" onclick="this.parentElement.style.display='none';">&times;</span>
+    We were unable to automatically find available Wifi networks to connect to. Please, fill out the form below out. 
+  </div>
+  {{end}}
+  {{if ne (len .SSID) 0}}
+    <div >
+      You provided credentials for <b>{{.SSID}}</b><br/><br/>
+    </div>
+  {{end}}
+  <h2>Wifi Details</h2>
+
+  <form method="post" action="/save">
+    <div class="form-group">
+      <label for="network">Network</label>
+      {{if eq (len .VisibleSSIDs) 0}}
+        <input type="text" name="ssid" placeholder="enter Wifi SSID" id="network" required>
+      {{else}}
+        <div class="select-border">
+          <select name="ssid" id="network" required>
+            <option value="">--Please choose an option--</option>
+            {{range .VisibleSSIDs}}
+              {{if ne (len .) 0}}
+                <option value="{{.}}">{{.}}</option>
+              {{end}}
+            {{end}}
+          </select>
+        </div>
+      {{end}}
+    </div>
+
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="text" name="password" id="password" placeholder="Password" required>
+    </div>
+    
+    <button id="submit" class="btn-submit" type="submit" onclick="submitForm()">Save</button>
+  </form>
+</div>
+{{end}}
