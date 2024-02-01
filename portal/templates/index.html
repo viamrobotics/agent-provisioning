@@ -1,15 +1,13 @@
 {{define "scripts"}}{{end}}
 {{define "body"}}
 
-
-{{if eq (len .VisibleSSIDs) 0}}
-<div >
-  <span class="closebtn" onclick="this.parentElement.style.display='none';">&times;</span>
-  We were unable to automatically found available Wifi networks to connect to. Please, fill out the form below out. 
-</div>
-{{end}}
-
 <div class="container">
+  {{if eq (len .VisibleSSIDs) 0}}
+  <div >
+    <span class="closebtn" onclick="this.parentElement.style.display='none';">&times;</span>
+    We were unable to automatically find available Wifi networks to connect to. Please, fill out the form below out. 
+  </div>
+  {{end}}
   {{if ne (len .SSID) 0}}
     <div >
       You provided credentials for <b>{{.SSID}}</b><br/><br/>
