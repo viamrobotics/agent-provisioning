@@ -44,7 +44,6 @@ func NewPortal(logger *zap.SugaredLogger, bindAddr string) *CaptivePortal {
 	mux := http.NewServeMux()
 	cp := &CaptivePortal{logger: logger, server: &http.Server{Addr: bindAddr, Handler: mux}}
 	mux.HandleFunc("/", cp.index)
-	//mux.HandleFunc("/captive", cp.serveCaptive)
 	mux.HandleFunc("/save", cp.saveWifi)
 	return cp
 }
@@ -139,25 +138,3 @@ func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
 
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
-
-
-// Captive-portal magic for phones
-// type CaptiveJson struct {
-// 	Captive       bool   `json:"captive"`
-// 	UserPortalUrl string `json:"user-portal-url"`
-// }
-
-// func (cp *CaptivePortal) serveCaptive(w http.ResponseWriter, r *http.Request) {
-// 	defer r.Body.Close()
-// 	log.Printf(r.Host, r.URL.Path, r.Body, r.Header, r.Method)
-// 	j, err := json.Marshal(CaptiveJson{
-// 		Captive:       true,
-// 		UserPortalUrl: "http://192.168.2.2/",
-// 	})
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-
-// 	w.Header().Set("Content-Type", "application/captive+json")
-// 	w.Write(j)
-// }
