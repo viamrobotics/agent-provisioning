@@ -33,14 +33,14 @@ func GetRevision() string {
 	return GitRevision
 }
 
-
 type ProvisioningConfig struct {
 	Manufacturer string `json:"manufacturer"`
 	Model        string `json:"model"`
 	FragmentID   string `json:"fragment_id"`
 
-	HotspotPrefix   string `json:"hotspot_prefix"`
-	HotspotPassword string `json:"hotspot_password"`
+	HotspotPrefix          string `json:"hotspot_prefix"`
+	HotspotPassword        string `json:"hotspot_password"`
+	DisableCaptiveRedirect bool   `json:"disable_captive_redirect"`
 }
 
 func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
@@ -68,17 +68,16 @@ func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
 	return newConfig, nil
 }
 
-
 type Config struct {
-	HotspotPassword string `json:"hotspot_password"`
-	Networks []NetworkConfig `json:"networks"`
+	HotspotPassword string          `json:"hotspot_password"`
+	Networks        []NetworkConfig `json:"networks"`
 }
 
 type NetworkConfig struct {
-	Type string `json:"type"`
-	SSID string `json:"ssid"`
-	PSK  string `json:"psk"`
-	Priority int `json:"priority"`
+	Type     string `json:"type"`
+	SSID     string `json:"ssid"`
+	PSK      string `json:"psk"`
+	Priority int    `json:"priority"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -99,6 +98,7 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 type ContextKey string
+
 const HCReqKey = ContextKey("healthcheck")
 
 func HealthySleep(ctx context.Context, timeout time.Duration) bool {
