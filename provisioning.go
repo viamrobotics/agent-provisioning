@@ -1,3 +1,4 @@
+// Package provisioning holds utility functions and structures used by other modules in this project.
 package provisioning
 
 import (
@@ -33,7 +34,6 @@ func GetRevision() string {
 	return GitRevision
 }
 
-
 type ProvisioningConfig struct {
 	Manufacturer string `json:"manufacturer"`
 	Model        string `json:"model"`
@@ -51,7 +51,7 @@ func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
 		HotspotPrefix:   "viam-setup",
 		HotspotPassword: "viamsetup",
 	}
-
+	//nolint:gosec
 	jsonBytes, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -68,20 +68,20 @@ func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
 	return newConfig, nil
 }
 
-
 type Config struct {
-	HotspotPassword string `json:"hotspot_password"`
-	Networks []NetworkConfig `json:"networks"`
+	HotspotPassword string          `json:"hotspot_password"`
+	Networks        []NetworkConfig `json:"networks"`
 }
 
 type NetworkConfig struct {
-	Type string `json:"type"`
-	SSID string `json:"ssid"`
-	PSK  string `json:"psk"`
-	Priority int `json:"priority"`
+	Type     string `json:"type"`
+	SSID     string `json:"ssid"`
+	PSK      string `json:"psk"`
+	Priority int    `json:"priority"`
 }
 
 func LoadConfig(path string) (*Config, error) {
+	//nolint:gosec
 	jsonBytes, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -99,12 +99,15 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 type ContextKey string
+
 const HCReqKey = ContextKey("healthcheck")
 
+// HealthySleep allows a process to sleep while stil responding to context cancellation AND healthchecks.
 func HealthySleep(ctx context.Context, timeout time.Duration) bool {
 	hc, ok := ctx.Value(HCReqKey).(*atomic.Bool)
 	if !ok {
 		// this should never happen, so avoiding having to pass a logger by just printing
+		//nolint:forbidigo
 		fmt.Println("context passed to HealthySleep without healthcheck value")
 	}
 
@@ -114,6 +117,7 @@ func HealthySleep(ctx context.Context, timeout time.Duration) bool {
 	go func() {
 		for {
 			if hc.Swap(false) {
+				//nolint:forbidigo
 				fmt.Println("HEALTHY")
 			}
 			if stop.Load() {
