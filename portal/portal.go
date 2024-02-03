@@ -141,6 +141,7 @@ func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		cp.mu.Lock()
 		defer cp.mu.Unlock()
+		cp.lastInteraction = time.Now()
 		cp.ssid = r.FormValue("ssid")
 		cp.psk = r.FormValue("password")
 		cp.logger.Debugf("saving credentials for %s", cp.ssid)

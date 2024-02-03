@@ -28,6 +28,7 @@ var (
 
 func main() {
 	ctx := setupExitSignalHandling()
+	defer activeBackgroundWorkers.Wait()
 
 	//nolint:lll
 	var opts struct {
@@ -65,7 +66,7 @@ func main() {
 
 	pCfg, err := provisioning.LoadProvisioningConfig(opts.ProvisioningConfig)
 	if err != nil {
-		log.Warn(err)
+		log.Error(errw.Wrapf(err, "error loading %s, using defaults", opts.ProvisioningConfig))
 	}
 
 	cfg, err := provisioning.LoadConfig(opts.Config)
@@ -105,7 +106,6 @@ func main() {
 	var settingsChan <-chan netman.WifiSettings
 	for {
 		if !provisioning.HealthySleep(ctx, time.Second*15) {
-			activeBackgroundWorkers.Wait()
 			return
 		}
 
@@ -162,7 +162,7 @@ func main() {
 		select {
 		case settings := <-settingsChan:
 			// non-empty settings mean add a new network and exit provisioning mode
-			if settings.SSID != "" && settings.PSK != "" {
+			if settings.SSID != "" {
 				log.Debug("settings received")
 				err := nm.AddOrUpdateConnection(provisioning.NetworkConfig{
 					Type:     "wifi",
@@ -176,9 +176,8 @@ func main() {
 					continue
 				}
 				activateSSID = settings.SSID
-			}
-			// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
-			if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
+			} else if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
+				// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
 				shouldStopProvisioning = false
 			}
 		case <-ctx.Done():

@@ -4,12 +4,13 @@ package provisioning
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
 var (
@@ -39,12 +40,13 @@ type ProvisioningConfig struct {
 	Model        string `json:"model"`
 	FragmentID   string `json:"fragment_id"`
 
-	HotspotPrefix   string `json:"hotspot_prefix"`
-	HotspotPassword string `json:"hotspot_password"`
+	HotspotPrefix      string `json:"hotspot_prefix"`
+	HotspotPassword    string `json:"hotspot_password"`
+	DisableDNSRedirect bool   `json:"disable_dns_redirect"`
 }
 
 func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
-	defaultConfig := &ProvisioningConfig{
+	defaultConf := ProvisioningConfig{
 		Manufacturer:    "viam",
 		Model:           "custom",
 		FragmentID:      "",
@@ -55,17 +57,20 @@ func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
 	jsonBytes, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return defaultConfig, nil
+			return &defaultConf, nil
 		}
-		return defaultConfig, err
+		return &defaultConf, err
+	}
+	conf := defaultConf
+	if err = json.Unmarshal(jsonBytes, &conf); err != nil {
+		return &defaultConf, err
 	}
 
-	newConfig := &ProvisioningConfig{}
-	if err = json.Unmarshal(jsonBytes, newConfig); err != nil {
-		return defaultConfig, err
+	if conf.Manufacturer == "" || conf.Model == "" || conf.HotspotPrefix == "" || conf.HotspotPassword == "" {
+		return &defaultConf, errors.Errorf("values in %s cannot be empty, please omit empty fields entirely", path)
 	}
 
-	return newConfig, nil
+	return &conf, nil
 }
 
 type Config struct {

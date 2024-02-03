@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	DNSMasqFilepath = "/etc/NetworkManager/dnsmasq-shared.d/80-viam.conf"
-	DNSMasqContents = "address=/#/10.42.0.1\n"
+	DNSMasqFilepath          = "/etc/NetworkManager/dnsmasq-shared.d/80-viam.conf"
+	DNSMasqContentsRedirect  = "address=/#/10.42.0.1\n"
+	DNSMasqContentsSetupOnly = "address=/.setup/10.42.0.1\n"
 
 	ConnCheckFilepath = "/etc/NetworkManager/conf.d/80-viam.conf"
 	ConnCheckContents = "[connectivity]\nuri=http://packages.viam.com/check_network_status.txt\ninterval=300\n"
@@ -58,6 +59,7 @@ type NMWrapper struct {
 	knownSSIDs   map[string]gnm.Connection
 	triedSSIDs   map[string]bool // union of knownSSIDs that have also been visible when NOT in provisioning mode
 	hotspotConn  gnm.Connection
+	hotspotSSID  string
 	activeConn   gnm.ActiveConnection
 }
 
@@ -271,18 +273,18 @@ func (w *NMWrapper) updateKnownConnections() error {
 		w.knownSSIDs[string(ssidBytes)] = conn
 	}
 
-	hotspotSSID := w.pCfg.HotspotPrefix + "-" + strings.ToLower(w.hostname)
-	if len(hotspotSSID) > 32 {
-		hotspotSSID = hotspotSSID[:32]
+	w.hotspotSSID = w.pCfg.HotspotPrefix + "-" + strings.ToLower(w.hostname)
+	if len(w.hotspotSSID) > 32 {
+		w.hotspotSSID = w.hotspotSSID[:32]
 	}
 	if w.hotspotConn == nil {
-		conn, err := w.settings.AddConnection(w.getSettingsHotspot(w.pCfg.HotspotPrefix, hotspotSSID, w.pCfg.HotspotPassword))
+		conn, err := w.settings.AddConnection(w.getSettingsHotspot(w.pCfg.HotspotPrefix, w.hotspotSSID, w.pCfg.HotspotPassword))
 		if err != nil {
 			return err
 		}
 		w.hotspotConn = conn
 	} else {
-		err = w.hotspotConn.Update(w.getSettingsHotspot(w.pCfg.HotspotPrefix, hotspotSSID, w.pCfg.HotspotPassword))
+		err = w.hotspotConn.Update(w.getSettingsHotspot(w.pCfg.HotspotPrefix, w.hotspotSSID, w.pCfg.HotspotPassword))
 		if err != nil {
 			return err
 		}
@@ -304,10 +306,9 @@ func (w *NMWrapper) getSettingsWifi(id, ssid, psk string, priority int) gnm.Conn
 			"mode": "infrastructure",
 			"ssid": []byte(ssid),
 		},
-		"802-11-wireless-security": map[string]interface{}{
-			"key-mgmt": "wpa-psk",
-			"psk":      psk,
-		},
+	}
+	if psk != "" {
+		settings["802-11-wireless-security"] = map[string]interface{}{"key-mgmt": "wpa-psk", "psk": psk}
 	}
 	return settings
 }
@@ -377,7 +378,9 @@ func (w *NMWrapper) WifiScan(ctx context.Context) error {
 		if err != nil {
 			return errw.Wrap(err, "error scanning wifi")
 		}
-		ssids[ssid] = true
+		if ssid != w.hotspotSSID {
+			ssids[ssid] = true
+		}
 	}
 
 	var visibleSSIDs []string
@@ -437,15 +440,15 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, prevErr error) (<-cha
 	}
 	w.activeConn = activeConn
 
-	w.state.setProvisioning(true)
-
 	var hotspotActive bool
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
 	for {
 		state, err := w.activeConn.GetPropertyState()
 		if err != nil {
-			w.logger.Error(err)
+			w.activeConn = nil
+			w.mu.Unlock()
+			return nil, err
 		}
 		if state == gnm.NmActiveConnectionStateActivated {
 			hotspotActive = true
@@ -464,6 +467,7 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, prevErr error) (<-cha
 	// start portal with ssid list and known connections
 	w.cp = portal.NewPortal(w.logger, BindAddr)
 	w.cp.Run()
+	w.state.setProvisioning(true)
 	w.mu.Unlock()
 
 	w.workers.Add(1)
@@ -537,7 +541,10 @@ func (w *NMWrapper) StopProvisioning() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.state.setProvisioning(false)
-	err := w.cp.Stop()
+	var err error
+	if w.cp != nil {
+		err = w.cp.Stop()
+	}
 	w.cp = nil
 
 	if w.activeConn != nil {
@@ -561,7 +568,7 @@ func (w *NMWrapper) Close() {
 func (w *NMWrapper) GetLastInteraction() time.Time {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.cp != nil {
+	if w.cp == nil {
 		return time.Time{}
 	}
 	return w.cp.GetLastInteraction()
@@ -601,6 +608,11 @@ func (w *NMWrapper) AddOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 }
 
 func (w *NMWrapper) writeDNSMasq() error {
+	DNSMasqContents := DNSMasqContentsRedirect
+	if w.pCfg.DisableDNSRedirect {
+		DNSMasqContents = DNSMasqContentsSetupOnly
+	}
+
 	fileBytes, err := os.ReadFile(DNSMasqFilepath)
 	if err == nil && bytes.Equal(fileBytes, []byte(DNSMasqContents)) {
 		return nil
