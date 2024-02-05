@@ -1,3 +1,4 @@
+// Package portal is the web portal and grpc server for provisioning.
 package portal
 
 import (
@@ -15,26 +16,26 @@ import (
 type CaptivePortal struct {
 	logger *zap.SugaredLogger
 
-	mu sync.Mutex
+	mu              sync.Mutex
 	lastInteraction time.Time
-	server *http.Server
-	visibleSSIDs []string
-	savedSSIDs []string
-	lastError error
+	server          *http.Server
+	visibleSSIDs    []string
+	savedSSIDs      []string
+	lastError       error
 
 	ssid string
 	psk  string
 
 	inputRecieved atomic.Bool
-	workers sync.WaitGroup
+	workers       sync.WaitGroup
 }
 
-type TemplateData struct{
+type TemplateData struct {
 	SSID string
 
 	VisibleSSIDs []string
-	KnownSSIDs []string
-	LastError string
+	KnownSSIDs   []string
+	LastError    string
 }
 
 //go:embed templates/*
@@ -42,7 +43,7 @@ var templates embed.FS
 
 func NewPortal(logger *zap.SugaredLogger, bindAddr string) *CaptivePortal {
 	mux := http.NewServeMux()
-	cp := &CaptivePortal{logger: logger, server: &http.Server{Addr: bindAddr, Handler: mux}}
+	cp := &CaptivePortal{logger: logger, server: &http.Server{Addr: bindAddr, Handler: mux, ReadTimeout: time.Second * 10}}
 	mux.HandleFunc("/", cp.index)
 	mux.HandleFunc("/save", cp.saveWifi)
 	return cp
@@ -84,7 +85,7 @@ func (cp *CaptivePortal) GetUserInput() (string, string, bool) {
 	return "", "", ok
 }
 
-func (cp *CaptivePortal) GetLastInteraction() (time.Time) {
+func (cp *CaptivePortal) GetLastInteraction() time.Time {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 	return cp.lastInteraction
@@ -99,13 +100,18 @@ func (cp *CaptivePortal) SetData(visibleSSIDs, savedSSIDs []string, lastError er
 }
 
 func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			cp.logger.Error(err)
+		}
+	}()
+
 	cp.mu.Lock()
 	cp.lastInteraction = time.Now()
 	data := TemplateData{
-		SSID: cp.ssid,
+		SSID:         cp.ssid,
 		VisibleSSIDs: cp.visibleSSIDs,
-		KnownSSIDs: cp.savedSSIDs,
+		KnownSSIDs:   cp.savedSSIDs,
 	}
 	if cp.lastError != nil {
 		data.LastError = cp.lastError.Error()
@@ -126,10 +132,16 @@ func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	if r.Method == "POST" {
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			cp.logger.Error(err)
+		}
+	}()
+
+	if r.Method == http.MethodPost {
 		cp.mu.Lock()
 		defer cp.mu.Unlock()
+		cp.lastInteraction = time.Now()
 		cp.ssid = r.FormValue("ssid")
 		cp.psk = r.FormValue("password")
 		cp.logger.Debugf("saving credentials for %s", cp.ssid)

@@ -22,20 +22,22 @@ import (
 var (
 	// only changed/set at startup, so no mutex.
 	log = golog.NewDevelopmentLogger("agent-provisioning")
+
 	activeBackgroundWorkers sync.WaitGroup
 )
 
 func main() {
 	ctx := setupExitSignalHandling()
+	defer activeBackgroundWorkers.Wait()
 
+	//nolint:lll
 	var opts struct {
-		Config  string `default:"/opt/viam/etc/agent-provisioning.json"              description:"Path to config file" long:"config" short:"c"`
-		AppConfig    string `default:"/etc/viam.json"              description:"Path to main viam cloud (app) config file" long:"app" short:"a"`
-		ProvisioningConfig    string `default:"/etc/viam-provisioning.json"              description:"Path to provisioning (customization) config file" long:"provisioning" short:"p"`
-		Debug   bool   `description:"Enable debug logging"    long:"debug"                      short:"d"`
-		Help    bool   `description:"Show this help message"  long:"help"                       short:"h"`
-		Version bool   `description:"Show version"            long:"version"                    short:"v"`
-		//Install bool   `description:"Install systemd service" long:"install"`
+		Config             string `default:"/opt/viam/etc/agent-provisioning.json" description:"Path to config file"                              long:"config"       short:"c"`
+		AppConfig          string `default:"/etc/viam.json"                        description:"Path to main viam cloud (app) config file"        long:"app"          short:"a"`
+		ProvisioningConfig string `default:"/etc/viam-provisioning.json"           description:"Path to provisioning (customization) config file" long:"provisioning" short:"p"`
+		Debug              bool   `description:"Enable debug logging"              long:"debug"                                                   short:"d"`
+		Help               bool   `description:"Show this help message"            long:"help"                                                    short:"h"`
+		Version            bool   `description:"Show version"                      long:"version"                                                 short:"v"`
 	}
 
 	parser := flags.NewParser(&opts, flags.IgnoreUnknown)
@@ -53,6 +55,7 @@ func main() {
 	}
 
 	if opts.Version {
+		//nolint:forbidigo
 		fmt.Printf("Version: %s\nGit Revision: %s\n", provisioning.GetVersion(), provisioning.GetRevision())
 		return
 	}
@@ -63,7 +66,7 @@ func main() {
 
 	pCfg, err := provisioning.LoadProvisioningConfig(opts.ProvisioningConfig)
 	if err != nil {
-		log.Warn(err)
+		log.Error(errw.Wrapf(err, "error loading %s, using defaults", opts.ProvisioningConfig))
 	}
 
 	cfg, err := provisioning.LoadConfig(opts.Config)
@@ -102,9 +105,8 @@ func main() {
 
 	var settingsChan <-chan netman.WifiSettings
 	for {
-		if !provisioning.HealthySleep(ctx, time.Second * 15) {
-				activeBackgroundWorkers.Wait()
-				return
+		if !provisioning.HealthySleep(ctx, time.Second*15) {
+			return
 		}
 
 		online, err := nm.CheckOnline()
@@ -133,11 +135,11 @@ func main() {
 			log.Error(err)
 		}
 		provisioningMode, provisioningTime := nm.GetProvisioning()
-		 _, _, lastOnline := nm.GetOnline()
+		_, _, lastOnline := nm.GetOnline()
 		// not in provisioning mode, so start it if not configured (/etc/viam.json)
 		// OR as long as we've been OUT of provisioning for two minutes to try connections
-		if !provisioningMode && 
-			(!configured || time.Now().After(provisioningTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute * 2))) {
+		if !provisioningMode &&
+			(!configured || time.Now().After(provisioningTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute*2))) {
 			log.Debug("starting provisioning mode")
 			settingsChan, err = nm.StartProvisioning(ctx, prevError)
 			if err != nil {
@@ -160,12 +162,12 @@ func main() {
 		select {
 		case settings := <-settingsChan:
 			// non-empty settings mean add a new network and exit provisioning mode
-			if settings.SSID != "" && settings.PSK != "" {
-				log.Debug("settings recieved")
+			if settings.SSID != "" {
+				log.Debug("settings received")
 				err := nm.AddOrUpdateConnection(provisioning.NetworkConfig{
-					Type: "wifi",
-					SSID: settings.SSID,
-					PSK: settings.PSK,
+					Type:     "wifi",
+					SSID:     settings.SSID,
+					PSK:      settings.PSK,
 					Priority: 100,
 				})
 				if err != nil {
@@ -174,9 +176,8 @@ func main() {
 					continue
 				}
 				activateSSID = settings.SSID
-			}
-			// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
-			if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
+			} else if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
+				// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
 				shouldStopProvisioning = false
 			}
 		case <-ctx.Done():
