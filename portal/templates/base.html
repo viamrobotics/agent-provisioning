@@ -54,18 +54,31 @@
         color: #999;
     }
 
-    .btn-submit {
-        width: 100%;
-        padding: 10px;
+    .btn {
         border: none;
-        background-color: #007bff;
-        color: white;
         border-radius: 4px;
+        color: white;
         cursor: pointer;
+        padding: 10px;
+    }
+
+    .btn-submit {
+        background-color: #007bff;
+        width: 100%;
     }
 
     .btn-submit:hover {
         background-color: #0056b3;
+    }
+
+    .btn-refresh {
+        background-color: slateblue;
+        margin-top: 36px;
+        width: 50%;
+    }
+
+    .btn-refresh:hover {
+        background-color: darkslateblue;
     }
 </style>
   {{ template "scripts" }}
