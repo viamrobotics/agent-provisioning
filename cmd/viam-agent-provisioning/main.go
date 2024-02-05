@@ -15,7 +15,7 @@ import (
 	"github.com/jessevdk/go-flags"
 	errw "github.com/pkg/errors"
 
-	"github.com/viamrobotics/agent-provisioning"
+	provisioning "github.com/viamrobotics/agent-provisioning"
 	netman "github.com/viamrobotics/agent-provisioning/networkmanager"
 )
 
@@ -116,6 +116,8 @@ func main() {
 
 		if online {
 			nm.MarkSSIDsTried()
+		} else {
+			online = nm.CheckKnownSSIDs()
 		}
 
 		// check if we have a readable cloud config, if not, we need to enter provisioning mode

@@ -585,6 +585,26 @@ func (w *NMWrapper) ActivateConnection(ssid string) error {
 	return err
 }
 
+func (w *NMWrapper) CheckKnownSSIDs() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	online := false
+	for ssid := range w.knownSSIDs {
+		w.logger.Debugf("checking known SSIDs", "ssid", ssid)
+		err := w.ActivateConnection(ssid)
+
+		if err == nil {
+			online = true
+			break
+		}
+
+		w.logger.Debugf("error connecting to ssid", "ssid", ssid, "err", err)
+	}
+
+	return online
+}
+
 func (w *NMWrapper) AddOrUpdateConnection(cfg provisioning.NetworkConfig) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
