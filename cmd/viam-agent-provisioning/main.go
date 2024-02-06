@@ -96,14 +96,12 @@ func main() {
 	// exact text is important, the parent process will watch for this line to indicate startup is successful
 	log.Info("agent-provisioning startup complete")
 
-	var prevError error
-
 	// initial scan
 	if err := nm.WifiScan(ctx); err != nil {
 		log.Error(err)
 	}
 
-	var settingsChan <-chan netman.WifiSettings
+	var settingsChan <-chan *provisioning.UserInput
 	for {
 		if !provisioning.HealthySleep(ctx, time.Second*15) {
 			return
@@ -118,10 +116,7 @@ func main() {
 			nm.MarkSSIDsTried()
 		}
 
-		// check if we have a readable cloud config, if not, we need to enter provisioning mode
-		_, err = os.ReadFile(opts.AppConfig)
-
-		configured := err == nil
+		configured := nm.CheckConfigured(opts.AppConfig)
 
 		log.Debugf("online: %t, config_present: %t", online, configured)
 
@@ -141,7 +136,7 @@ func main() {
 		if !provisioningMode &&
 			(!configured || time.Now().After(provisioningTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute*2))) {
 			log.Debug("starting provisioning mode")
-			settingsChan, err = nm.StartProvisioning(ctx, prevError)
+			settingsChan, err = nm.StartProvisioning(ctx)
 			if err != nil {
 				log.Error(errw.Wrap(err, "error starting provisioning mode"))
 				continue
@@ -161,9 +156,14 @@ func main() {
 		shouldStopProvisioning := true
 		select {
 		case settings := <-settingsChan:
+			if settings == nil && !time.Now().After(nm.GetLastInteraction().Add(time.Minute*5)) {
+				// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
+				shouldStopProvisioning = false
+			}
+
 			// non-empty settings mean add a new network and exit provisioning mode
-			if settings.SSID != "" {
-				log.Debug("settings received")
+			if settings != nil && settings.SSID != "" {
+				log.Debug("wifi settings received")
 				err := nm.AddOrUpdateConnection(provisioning.NetworkConfig{
 					Type:     "wifi",
 					SSID:     settings.SSID,
@@ -171,15 +171,23 @@ func main() {
 					Priority: 100,
 				})
 				if err != nil {
-					prevError = err
+					nm.AppendError(err)
 					log.Error(err)
 					continue
 				}
 				activateSSID = settings.SSID
-			} else if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
-				// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
-				shouldStopProvisioning = false
 			}
+
+			if settings != nil && (settings.RawConfig != "" || settings.PartID != "") {
+				log.Debug("device config received")
+				err := provisioning.WriteDeviceConfig(opts.AppConfig, settings)
+				if err != nil {
+					nm.AppendError(err)
+					log.Error(err)
+					continue
+				}
+			}
+
 		case <-ctx.Done():
 			log.Debug("main context cancelled")
 		case <-time.After(10 * time.Minute):
@@ -199,8 +207,8 @@ func main() {
 		}
 		// force activating the SSID to save time (or if it was somehow manually disabled)
 		if activateSSID != "" {
-			if err := nm.ActivateConnection(activateSSID); err != nil {
-				prevError = err
+			if err := nm.ActivateConnection(ctx, activateSSID); err != nil {
+				nm.AppendError(err)
 				log.Error(err)
 			}
 		}

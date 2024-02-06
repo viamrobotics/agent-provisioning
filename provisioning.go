@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	pb "go.viam.com/api/provisioning/v1"
 )
 
 var (
@@ -45,6 +46,91 @@ type ProvisioningConfig struct {
 	DisableDNSRedirect bool   `json:"disable_dns_redirect"`
 }
 
+type NetworkInfo struct {
+	Type      string
+	SSID      string
+	Security  string
+	Signal    int32
+	Connected bool
+	LastError string
+}
+
+func NetworkInfoToProto(net *NetworkInfo) *pb.NetworkInfo {
+	return &pb.NetworkInfo{
+		Type:      net.Type,
+		Ssid:      net.SSID,
+		Security:  net.Security,
+		Signal:    net.Signal,
+		Connected: net.Connected,
+		LastError: net.LastError,
+	}
+}
+
+func NetworkInfoFromProto(buf *pb.NetworkInfo) *NetworkInfo {
+	return &NetworkInfo{
+		Type:      buf.GetType(),
+		SSID:      buf.GetSsid(),
+		Security:  buf.GetSecurity(),
+		Signal:    buf.GetSignal(),
+		Connected: buf.GetConnected(),
+		LastError: buf.GetLastError(),
+	}
+}
+
+type NetworkConfig struct {
+	Type     string `json:"type"`
+	SSID     string `json:"ssid"`
+	PSK      string `json:"psk"`
+	Priority int    `json:"priority"`
+}
+
+// DeviceConfig represents the minimal needed for /etc/viam.json.
+type DeviceConfig struct {
+	Cloud *CloudConfig `json:"cloud"`
+}
+
+type CloudConfig struct {
+	AppAddress string `json:"app_address"`
+	ID         string `json:"id"`
+	Secret     string `json:"secret"`
+}
+
+func WriteDeviceConfig(file string, input *UserInput) error {
+	if input.RawConfig != "" {
+		return os.WriteFile(file, []byte(input.RawConfig), 0o600)
+	}
+
+	cfg := &DeviceConfig{
+		Cloud: &CloudConfig{
+			AppAddress: input.AppAddr,
+			ID:         input.PartID,
+			Secret:     input.Secret,
+		},
+	}
+
+	jsonBytes, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(file, jsonBytes, 0o600)
+}
+
+type UserInput struct {
+	Updated time.Time
+
+	// network
+	SSID string
+	PSK  string
+
+	// device credentials
+	PartID  string
+	Secret  string
+	AppAddr string
+
+	// raw /etc/viam.json contents
+	RawConfig string
+}
+
 func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
 	defaultConf := ProvisioningConfig{
 		Manufacturer:    "viam",
@@ -76,13 +162,6 @@ func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
 type Config struct {
 	HotspotPassword string          `json:"hotspot_password"`
 	Networks        []NetworkConfig `json:"networks"`
-}
-
-type NetworkConfig struct {
-	Type     string `json:"type"`
-	SSID     string `json:"ssid"`
-	PSK      string `json:"psk"`
-	Priority int    `json:"priority"`
 }
 
 func LoadConfig(path string) (*Config, error) {

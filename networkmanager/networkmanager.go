@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,9 +33,9 @@ const (
 )
 
 var (
-	BindAddr = "10.42.0.1:80"
+	BindAddr = "10.42.0.1"
 	// older networkmanager requires unit32 arrays for IP addresses.
-	ipAsUint32 = binary.LittleEndian.Uint32([]byte{10, 42, 0, 1})
+	IPAsUint32 = binary.LittleEndian.Uint32([]byte{10, 42, 0, 1})
 )
 
 type NMWrapper struct {
@@ -55,12 +56,14 @@ type NMWrapper struct {
 	// requires locking
 	mu           sync.Mutex
 	lastScanTime time.Time
-	visibleSSIDs []string
+	visibleSSIDs []provisioning.NetworkInfo
 	knownSSIDs   map[string]gnm.Connection
 	triedSSIDs   map[string]bool // union of knownSSIDs that have also been visible when NOT in provisioning mode
+	lastTry      provisioning.NetworkInfo
 	hotspotConn  gnm.Connection
 	hotspotSSID  string
 	activeConn   gnm.ActiveConnection
+	errors       []error
 }
 
 func NewNMWrapper(logger *zap.SugaredLogger, pCfg *provisioning.ProvisioningConfig) (*NMWrapper, error) {
@@ -144,8 +147,22 @@ func (w *NMWrapper) GetOnline() (bool, time.Time, time.Time) {
 	return w.state.getOnline()
 }
 
+func (w *NMWrapper) GetConfigured() bool {
+	return w.state.getConfigured()
+}
+
 func (w *NMWrapper) GetProvisioning() (bool, time.Time) {
 	return w.state.getProvisioning()
+}
+
+func (w *NMWrapper) AppendError(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.cp != nil {
+		w.cp.AppendErrors(err)
+	} else {
+		w.errors = append(w.errors, err)
+	}
 }
 
 func (w *NMWrapper) CheckOnline() (bool, error) {
@@ -331,7 +348,7 @@ func (w *NMWrapper) getSettingsHotspot(id, ssid, psk string) gnm.ConnectionSetti
 		},
 		"ipv4": map[string]interface{}{
 			"method":    "shared",
-			"addresses": [][]uint32{{ipAsUint32, 24, ipAsUint32}},
+			"addresses": [][]uint32{{IPAsUint32, 24, IPAsUint32}},
 		},
 		"ipv6": map[string]interface{}{
 			"method": "disabled",
@@ -372,21 +389,52 @@ func (w *NMWrapper) WifiScan(ctx context.Context) error {
 		return errw.Wrap(err, "error scanning wifi")
 	}
 
-	ssids := make(map[string]bool)
+	ssids := make(map[string]provisioning.NetworkInfo)
 	for _, ap := range wifiList {
 		ssid, err := ap.GetPropertySSID()
 		if err != nil {
 			return errw.Wrap(err, "error scanning wifi")
 		}
+
+		signal, err := ap.GetPropertyStrength()
+		if err != nil {
+			return errw.Wrap(err, "error scanning wifi")
+		}
+
+		apFlags, err := ap.GetPropertyFlags()
+		if err != nil {
+			return errw.Wrap(err, "error scanning wifi")
+		}
+
+		wpaFlags, err := ap.GetPropertyWPAFlags()
+		if err != nil {
+			return errw.Wrap(err, "error scanning wifi")
+		}
+
+		rsnFlags, err := ap.GetPropertyRSNFlags()
+		if err != nil {
+			return errw.Wrap(err, "error scanning wifi")
+		}
+
 		if ssid != w.hotspotSSID {
-			ssids[ssid] = true
+			ssids[ssid] = provisioning.NetworkInfo{
+				Type:     "wifi",
+				SSID:     ssid,
+				Security: parseWPAFlags(apFlags, wpaFlags, rsnFlags),
+				Signal:   int32(signal),
+			}
 		}
 	}
 
-	var visibleSSIDs []string
-	for ssid := range ssids {
+	var visibleSSIDs []provisioning.NetworkInfo
+	for _, ssid := range ssids {
 		visibleSSIDs = append(visibleSSIDs, ssid)
 	}
+
+	// sort in reverse to put highest signal strength first
+	sort.SliceStable(visibleSSIDs, func(i, j int) bool {
+		return visibleSSIDs[i].Signal > visibleSSIDs[j].Signal
+	})
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -394,14 +442,14 @@ func (w *NMWrapper) WifiScan(ctx context.Context) error {
 	w.visibleSSIDs = visibleSSIDs
 
 	// mark ssids that are visible and known
-	for _, ssid := range visibleSSIDs {
-		_, ok := w.knownSSIDs[ssid]
+	for _, network := range visibleSSIDs {
+		_, ok := w.knownSSIDs[network.SSID]
 		if !ok {
 			continue
 		}
-		_, ok = w.triedSSIDs[ssid]
+		_, ok = w.triedSSIDs[network.SSID]
 		if !ok {
-			w.triedSSIDs[ssid] = false
+			w.triedSSIDs[network.SSID] = false
 		}
 	}
 
@@ -417,7 +465,7 @@ func (w *NMWrapper) MarkSSIDsTried() {
 }
 
 // StartProvisioning puts the wifi in hotspot mode and starts a captive portal.
-func (w *NMWrapper) StartProvisioning(ctx context.Context, prevErr error) (<-chan WifiSettings, error) {
+func (w *NMWrapper) StartProvisioning(ctx context.Context) (<-chan *provisioning.UserInput, error) {
 	// mark any SSIDs as already "tested" before we start scanning ourselves
 	w.MarkSSIDsTried()
 
@@ -465,8 +513,11 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, prevErr error) (<-cha
 	}
 
 	// start portal with ssid list and known connections
-	w.cp = portal.NewPortal(w.logger, BindAddr)
-	w.cp.Run()
+	w.cp = portal.NewPortal(w.logger, BindAddr, w.pCfg)
+	if err := w.cp.Run(); err != nil {
+		return nil, errw.Wrap(err, "could not start web/grpc portal")
+	}
+	w.cp.AppendErrors(w.errors...)
 	w.state.setProvisioning(true)
 	w.mu.Unlock()
 
@@ -490,7 +541,7 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, prevErr error) (<-cha
 		}
 	}()
 
-	settingsChan := make(chan WifiSettings)
+	settingsChan := make(chan *provisioning.UserInput)
 	w.workers.Add(1)
 	go func() {
 		defer w.workers.Done()
@@ -502,28 +553,27 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, prevErr error) (<-cha
 				return
 			}
 			// loop waiting for input
-			w.mu.Lock()
-			ssid, psk, ok := w.cp.GetUserInput()
-			if ok {
-				settingsChan <- WifiSettings{SSID: ssid, PSK: psk}
-				w.mu.Unlock()
+			userInput := w.cp.GetUserInput()
+			if userInput != nil {
+				settingsChan <- userInput
 				continue
 			}
-			var knownSSIDs []string
+			w.mu.Lock()
 			for k := range w.knownSSIDs {
-				knownSSIDs = append(knownSSIDs, k)
 				tried, ok := w.triedSSIDs[k]
-				// if a new SSID has appeared that needs to be tried, we send blank credentials to let provisioning mode exit
+				// if a new SSID has appeared that needs to be tried, we send a nil to let provisioning mode exit
 				if ok && !tried {
-					settingsChan <- WifiSettings{}
-					w.mu.Unlock()
-					continue
+					settingsChan <- nil
+					break
 				}
 			}
-			w.cp.SetData(w.visibleSSIDs, knownSSIDs, prevErr)
 
-			// end loop
+			online, _, _ := w.state.getOnline()
+			configured := w.state.getConfigured()
+			w.cp.SetData(online, configured, w.visibleSSIDs, w.lastTry)
+
 			w.mu.Unlock()
+			// end loop
 			if !provisioning.HealthySleep(ctx, time.Second) {
 				break
 			}
@@ -574,14 +624,27 @@ func (w *NMWrapper) GetLastInteraction() time.Time {
 	return w.cp.GetLastInteraction()
 }
 
-func (w *NMWrapper) ActivateConnection(ssid string) error {
+func (w *NMWrapper) ActivateConnection(ctx context.Context, ssid string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	conSettings, ok := w.knownSSIDs[ssid]
 	if !ok {
 		return errw.Errorf("no settings found for ssid: %s", ssid)
 	}
-	_, err := w.nm.ActivateConnection(conSettings, w.dev, nil)
+	activeConnection, err := w.nm.ActivateConnection(conSettings, w.dev, nil)
+	if err != nil {
+		return err
+	}
+	err = waitForConnect(ctx, activeConnection)
+
+	for i := range w.visibleSSIDs {
+		if w.visibleSSIDs[i].SSID == ssid {
+			if err != nil {
+				w.visibleSSIDs[i].LastError = err.Error()
+			}
+			w.lastTry = w.visibleSSIDs[i]
+		}
+	}
 	return err
 }
 
@@ -645,6 +708,8 @@ type connectionState struct {
 	onlineChange time.Time
 	lastOnline   time.Time
 
+	configured bool
+
 	provisioningMode   bool
 	provisioningChange time.Time
 }
@@ -666,6 +731,18 @@ func (c *connectionState) getOnline() (bool, time.Time, time.Time) {
 	return c.online, c.onlineChange, c.lastOnline
 }
 
+func (c *connectionState) setConfigured(configured bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.configured = configured
+}
+
+func (c *connectionState) getConfigured() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.configured
+}
+
 func (c *connectionState) setProvisioning(mode bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -684,4 +761,64 @@ type WifiSettings struct {
 	SSID     string
 	PSK      string
 	Priority int
+}
+
+func parseWPAFlags(apFlags, wpaFlags, rsnFlags uint32) string {
+	flags := []string{}
+	if apFlags&uint32(gnm.Nm80211APFlagsPrivacy) != 0 && wpaFlags == uint32(gnm.Nm80211APSecNone) && rsnFlags == uint32(gnm.Nm80211APSecNone) {
+		return "WEP"
+	}
+
+	if wpaFlags == uint32(gnm.Nm80211APSecNone) && rsnFlags == uint32(gnm.Nm80211APSecNone) {
+		return "-"
+	}
+
+	if wpaFlags != uint32(gnm.Nm80211APSecNone) {
+		flags = append(flags, "WPA1")
+	}
+	if rsnFlags&uint32(gnm.Nm80211APSecKeyMgmtPSK) != 0 || rsnFlags&uint32(gnm.Nm80211APSecKeyMgmt8021X) != 0 {
+		flags = append(flags, "WPA2")
+	}
+	if rsnFlags&uint32(gnm.Nm80211APSecKeyMgmtSAE) != 0 {
+		flags = append(flags, "WPA3")
+	}
+	if rsnFlags&uint32(gnm.Nm80211APSecKeyMgmtOWE) != 0 {
+		flags = append(flags, "OWE")
+	} else if rsnFlags&uint32(gnm.Nm80211APSecKeyMgmtOWETM) != 0 {
+		flags = append(flags, "OWE-TM")
+	}
+	if wpaFlags&uint32(gnm.Nm80211APSecKeyMgmt8021X) != 0 || rsnFlags&uint32(gnm.Nm80211APSecKeyMgmt8021X) != 0 {
+		flags = append(flags, "802.1X")
+	}
+
+	return strings.Join(flags, " ")
+}
+
+func (w *NMWrapper) CheckConfigured(path string) bool {
+	// check if we have a readable cloud config, if not, we need to enter provisioning mode
+	//nolint:gosec
+	_, err := os.ReadFile(path)
+	w.state.setConfigured(err == nil)
+	return err == nil
+}
+
+
+var ErrCouldNotActivate = errors.New("could not active connection")
+func waitForConnect(ctx context.Context, conn gnm.ActiveConnection) error {
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
+	for {
+		state, err := conn.GetPropertyState()
+		if err != nil {
+			// dbus errors are useless here, as when the connection fails, the object just goes away
+			// so we report our own instead
+			return ErrCouldNotActivate
+		}
+		if state == gnm.NmActiveConnectionStateActivated {
+			return nil
+		}
+		if timeoutCtx.Err() != nil {
+			return errors.Join(err, ErrCouldNotActivate)
+		}
+	}
 }
