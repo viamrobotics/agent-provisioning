@@ -18,8 +18,8 @@ func main() {
 	var opts struct {
 		Address string `description:"Address/port to dial (ex: 'localhost:4772')" long:"address" short:"a"`
 
-		SSID    string `description:"SSID to set"           long:"ssid"`
-		PSK     string `description:"PSK/Password for wifi" long:"psk"`
+		SSID string `description:"SSID to set"           long:"ssid"`
+		PSK  string `description:"PSK/Password for wifi" long:"psk"`
 
 		AppAddr string `default:"https://app.viam.com:443"              description:"Cloud address to set in viam.json" long:"appaddr"`
 		PartID  string `description:"PartID to set in viam.json"        long:"partID"`
@@ -38,14 +38,14 @@ func main() {
 		panic(err)
 	}
 
-	if opts.Address == "" || (opts.PartID == "" && opts.SSID == "" && !opts.Networks && !opts.Status){
+	if opts.Address == "" || (opts.PartID == "" && opts.SSID == "" && !opts.Networks && !opts.Status) {
 		opts.Help = true
 	}
 
 	if opts.Help {
 		var b bytes.Buffer
 		parser.WriteHelp(&b)
-		
+
 		fmt.Println(b.String())
 		return
 	}

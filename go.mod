@@ -6,7 +6,7 @@ require (
 	github.com/Wifx/gonetworkmanager/v2 v2.1.0
 	github.com/google/uuid v1.4.0
 	go.uber.org/zap v1.24.0
-	go.viam.com/api v0.0.0-00010101000000-000000000000
+	go.viam.com/api v0.1.260
 )
 
 require (
@@ -31,5 +31,3 @@ require (
 	github.com/pkg/errors v0.9.1
 	google.golang.org/grpc v1.61.0
 )
-
-replace go.viam.com/api => ../api

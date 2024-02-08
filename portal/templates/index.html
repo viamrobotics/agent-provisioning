@@ -56,7 +56,8 @@
 
     <button id="submit" class="btn btn-submit" type="submit" onclick="submitForm()">Save</button>
   </form>
-
+  {{if not .IsOnline}}
   <button class="btn btn-refresh" onclick="location.reload()">Refresh Network List</button>
+  {{end}}
 </div>
 {{end}}

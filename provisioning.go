@@ -186,7 +186,7 @@ type ContextKey string
 
 const HCReqKey = ContextKey("healthcheck")
 
-// HealthySleep allows a process to sleep while stil responding to context cancellation AND healthchecks.
+// HealthySleep allows a process to sleep while stil responding to context cancellation AND healthchecks. Returns false if cancelled.
 func HealthySleep(ctx context.Context, timeout time.Duration) bool {
 	hc, ok := ctx.Value(HCReqKey).(*atomic.Bool)
 	if !ok {

@@ -48,7 +48,8 @@ type deviceStatus struct {
 	errors           []error
 }
 
-type TemplateData struct {
+// SMURF TODO add machine/model/fragment info to display.
+type templateData struct {
 	LastNetwork  provisioning.NetworkInfo
 	VisibleSSIDs []provisioning.NetworkInfo
 	Errors       []string
@@ -182,7 +183,7 @@ func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 	defer cp.mu.Unlock()
 	cp.lastInteraction = time.Now()
 
-	data := TemplateData{
+	data := templateData{
 		LastNetwork:  cp.status.lastNetwork,
 		VisibleSSIDs: cp.status.visibleNetworks,
 		IsOnline:     cp.status.online,

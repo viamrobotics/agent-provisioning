@@ -9,7 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/edaniels/golog"
 	"github.com/jessevdk/go-flags"
@@ -79,7 +78,7 @@ func main() {
 		pCfg.HotspotPassword = cfg.HotspotPassword
 	}
 
-	nm, err := netman.NewNMWrapper(log, pCfg)
+	nm, err := netman.NewNMWrapper(ctx, log, pCfg, opts.AppConfig)
 	if err != nil {
 		log.Error(err)
 		return
@@ -96,123 +95,133 @@ func main() {
 	// exact text is important, the parent process will watch for this line to indicate startup is successful
 	log.Info("agent-provisioning startup complete")
 
-	// initial scan
-	if err := nm.WifiScan(ctx); err != nil {
+	if err := nm.StartMonitoring(ctx); err != nil {
 		log.Error(err)
 	}
 
-	var settingsChan <-chan *provisioning.UserInput
-	for {
-		if !provisioning.HealthySleep(ctx, time.Second*15) {
-			return
-		}
+	<-ctx.Done()
+	log.Info("provisioning subsystem exiting")
 
-		online, err := nm.CheckOnline()
-		if err != nil {
-			log.Error(err)
-		}
+	// // initial scan
+	// if err := nm.WifiScan(ctx); err != nil {
+	// 	log.Error(err)
+	// }
 
-		if online {
-			nm.MarkSSIDsTried()
-		}
+	// var settingsChan <-chan *provisioning.UserInput
+	// for {
+	// 	if !provisioning.HealthySleep(ctx, time.Second*15) {
+	// 		return
+	// 	}
 
-		configured := nm.CheckConfigured(opts.AppConfig)
+	// 	online, err := nm.CheckOnline()
+	// 	if err != nil {
+	// 		log.Error(err)
+	// 	}
 
-		log.Debugf("online: %t, config_present: %t", online, configured)
+	// 	if online {
+	// 		nm.MarkSSIDsTried()
+	// 	}
 
-		// restart the loop if everything is good
-		if online && configured {
-			continue
-		}
+	// 	configured := nm.CheckConfigured(opts.AppConfig)
 
-		// provisioning mode logic starts here for when not online and configured
-		if err := nm.WifiScan(ctx); err != nil {
-			log.Error(err)
-		}
-		provisioningMode, provisioningTime := nm.GetProvisioning()
-		_, _, lastOnline := nm.GetOnline()
-		// not in provisioning mode, so start it if not configured (/etc/viam.json)
-		// OR as long as we've been OUT of provisioning for two minutes to try connections
-		if !provisioningMode &&
-			(!configured || time.Now().After(provisioningTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute*2))) {
-			log.Debug("starting provisioning mode")
-			settingsChan, err = nm.StartProvisioning(ctx)
-			if err != nil {
-				log.Error(errw.Wrap(err, "error starting provisioning mode"))
-				continue
-			}
-			provisioningMode = true
-		}
+	// 	log.Debugf("online: %t, config_present: %t", online, configured)
 
-		if !provisioningMode {
-			continue
-		}
+	// 	// restart the loop if everything is good
+	// 	if online && configured {
+	// 		continue
+	// 	}
 
-		// in provisioning mode, wait for settings from user OR timeout
-		log.Debug("provisioning mode ready, waiting for user input")
+	// 	// provisioning mode logic starts here for when not online and configured
+	// 	if err := nm.WifiScan(ctx); err != nil {
+	// 		log.Error(err)
+	// 	}
+	// 	provisioningMode, provisioningTime := nm.GetProvisioning()
+	// 	_, _, lastOnline := nm.GetOnline()
+	// 	// not in provisioning mode, so start it if not configured (/etc/viam.json)
+	// 	// OR as long as we've been OUT of provisioning for two minutes to try connections
+	// 	if !provisioningMode &&
+	// 		(!configured || time.Now().After(provisioningTime.Add(time.Second)) && time.Now().After(lastOnline.Add(time.Minute*2))) {
+	// 		log.Debug("starting provisioning mode")
+	// 		settingsChan, err = nm.StartProvisioning(ctx)
+	// 		if err != nil {
+	// 			log.Error(errw.Wrap(err, "error starting provisioning mode"))
+	// 			continue
+	// 		}
+	// 		provisioningMode = true
+	// 	} else {
+	// 		log.Debug("retrying known networks")
+	// 		// SMURF WIP
+	// 	}
 
-		var activateSSID string
-		// will exit provisioning after the select by default
-		shouldStopProvisioning := true
-		select {
-		case settings := <-settingsChan:
-			if settings == nil && !time.Now().After(nm.GetLastInteraction().Add(time.Minute*5)) {
-				// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
-				shouldStopProvisioning = false
-			}
+	// 	if !provisioningMode {
+	// 		continue
+	// 	}
 
-			// non-empty settings mean add a new network and exit provisioning mode
-			if settings != nil && settings.SSID != "" {
-				log.Debug("wifi settings received")
-				err := nm.AddOrUpdateConnection(provisioning.NetworkConfig{
-					Type:     "wifi",
-					SSID:     settings.SSID,
-					PSK:      settings.PSK,
-					Priority: 100,
-				})
-				if err != nil {
-					nm.AppendError(err)
-					log.Error(err)
-					continue
-				}
-				activateSSID = settings.SSID
-			}
+	// 	// in provisioning mode, wait for settings from user OR timeout
+	// 	log.Debug("provisioning mode ready, waiting for user input")
 
-			if settings != nil && (settings.RawConfig != "" || settings.PartID != "") {
-				log.Debug("device config received")
-				err := provisioning.WriteDeviceConfig(opts.AppConfig, settings)
-				if err != nil {
-					nm.AppendError(err)
-					log.Error(err)
-					continue
-				}
-			}
+	// 	var activateSSID string
+	// 	// will exit provisioning after the select by default
+	// 	shouldStopProvisioning := true
+	// 	select {
+	// 	case settings := <-settingsChan:
+	// 		if settings == nil && !time.Now().After(nm.GetLastInteraction().Add(time.Minute*5)) {
+	// 			// empty settings mean a known SSID newly became visible, but we don't exit if someone's in the portal
+	// 			shouldStopProvisioning = false
+	// 		}
 
-		case <-ctx.Done():
-			log.Debug("main context cancelled")
-		case <-time.After(10 * time.Minute):
-			// don't exit provisioning mode if someone is active in the portal
-			if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
-				shouldStopProvisioning = false
-			}
-			log.Debug("10 minute timeout")
-		}
+	// 		// non-empty settings mean add a new network and exit provisioning mode
+	// 		if settings != nil && settings.SSID != "" {
+	// 			log.Debug("wifi settings received")
+	// 			err := nm.AddOrUpdateConnection(provisioning.NetworkConfig{
+	// 				Type:     "wifi",
+	// 				SSID:     settings.SSID,
+	// 				PSK:      settings.PSK,
+	// 				Priority: 100,
+	// 			})
+	// 			if err != nil {
+	// 				nm.AppendError(err)
+	// 				log.Error(err)
+	// 				continue
+	// 			}
+	// 			activateSSID = settings.SSID
+	// 		}
 
-		if shouldStopProvisioning {
-			log.Debug("provisioning mode stopping")
-			err = nm.StopProvisioning()
-			if err != nil {
-				log.Error(err)
-			}
-		}
-		// force activating the SSID to save time (or if it was somehow manually disabled)
-		if activateSSID != "" {
-			if err := nm.ActivateConnection(ctx, activateSSID); err != nil {
-				nm.AppendError(err)
-				log.Error(err)
-			}
-		}
-	}
+	// 		if settings != nil && (settings.RawConfig != "" || settings.PartID != "") {
+	// 			log.Debug("device config received")
+	// 			err := provisioning.WriteDeviceConfig(opts.AppConfig, settings)
+	// 			if err != nil {
+	// 				nm.AppendError(err)
+	// 				log.Error(err)
+	// 				continue
+	// 			}
+	// 		}
+
+	// 	case <-ctx.Done():
+	// 		log.Debug("main context cancelled")
+	// 	case <-time.After(10 * time.Minute):
+	// 		// don't exit provisioning mode if someone is active in the portal
+	// 		if !time.Now().After(nm.GetLastInteraction().Add(time.Minute * 5)) {
+	// 			shouldStopProvisioning = false
+	// 		}
+	// 		log.Debug("10 minute timeout")
+	// 	}
+
+	// 	if shouldStopProvisioning {
+	// 		log.Debug("provisioning mode stopping")
+	// 		err = nm.StopProvisioning()
+	// 		if err != nil {
+	// 			log.Error(err)
+	// 		}
+	// 	}
+	// 	// force activating the SSID to save time (or if it was somehow manually disabled)
+	// 	if activateSSID != "" {
+	// 		if err := nm.ActivateConnection(ctx, activateSSID); err != nil {
+	// 			nm.AppendError(err)
+	// 			log.Error(err)
+	// 		}
+	// 	}
+	// }
 }
 
 func setupExitSignalHandling() context.Context {
