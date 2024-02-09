@@ -273,10 +273,8 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 		if lastScan > prevScan {
 			break
 		}
-		select {
-		case <-ctx.Done():
+		if !provisioning.HealthySleep(ctx, time.Second) {
 			return nil
-		case <-time.After(time.Second):
 		}
 	}
 
@@ -718,7 +716,7 @@ func waitForConnect(ctx context.Context, conn gnm.ActiveConnection) error {
 		if state == gnm.NmActiveConnectionStateActivated {
 			return nil
 		}
-		if timeoutCtx.Err() != nil {
+		if !provisioning.HealthySleep(timeoutCtx, time.Second) {
 			return errors.Join(err, ErrCouldNotActivateConnection)
 		}
 	}
