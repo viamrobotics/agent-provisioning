@@ -3,14 +3,14 @@
 
 <div class="container">
   {{if eq (len .VisibleSSIDs) 0}}
-  <div >
+  <div>
     <span class="btn-close" onclick="this.parentElement.style.display='none';">&times;</span>
     We were unable to automatically find available Wifi networks to connect to. Please refresh or manually enter the SSID below.
   </div>
   {{end}}
-  {{if .LastNetwork.SSID}}
-  <div >
-    You provided credentials for <b>{{.LastNetwork.SSID}}</b><br/><br/>
+  {{if .Banner}}
+  <div>
+    {{.Banner}}
   </div>
   {{end}}
 
@@ -22,6 +22,15 @@
   {{end}}
 
   <h2>Smart Machine Setup</h2>
+
+  <div class="info">
+    <div id="info_header">Device Info</div>
+    <div id="manufacturer_label">Manufacturer:</div><div id="manufacturer">{{.Manufacturer}}</div>
+    <div id="model_label">Model:</div><div id="model">{{.Model}}</div>
+    {{if .FragmentID}}
+    <div id="fragment_label">FragmentID:</div><div id="fragment">{{.FragmentID}}</div>
+    {{end}}
+  </div>
 
   <form method="post" action="/save">
     {{if not .IsOnline}}
@@ -50,7 +59,7 @@
     {{if not .IsConfigured}}
     <div class="form-group">
       <label for="viamconfig">Device Config</label>
-      <textarea type="textarea" name="viamconfig" id="viamconfig" placeholder="No config found on device. Paste your viam.json file here."></textarea>
+      <textarea type="textarea" name="viamconfig" id="viamconfig" required placeholder="No config found on device. Paste your viam.json file here."></textarea>
     </div>
     {{end}}
 

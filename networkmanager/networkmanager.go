@@ -38,10 +38,14 @@ var (
 	IPAsUint32                    = binary.LittleEndian.Uint32([]byte{10, 42, 0, 1})
 	ErrCouldNotActivateConnection = errors.New("could not activate connection")
 	ErrConnCheckDisabled          = errors.New("NetworkManager connectivity checking disabled by user, network management will be unavailable")
+	ErrNoActiveConnectionFound    = errors.New("no active connection found")
+	loopDelay                     = time.Second * 15
+	connectTimeout                = time.Second * 30
 )
 
 type NMWrapper struct {
-	workers sync.WaitGroup
+	monitorWorkers sync.WaitGroup
+	pModeWorkers   sync.WaitGroup
 
 	// blocks start/stop/etc operations
 	opMu sync.Mutex
@@ -64,30 +68,12 @@ type NMWrapper struct {
 	networks    map[string]*network
 	hotspotSSID string
 	activeSSID  string
+	lastSSID    string
 }
 
-func (w *NMWrapper) getConnectionCandidates() []*network {
-	var candidates []*network
-	for _, nw := range w.networks {
-		// ssid seen within the past minute
-		visible := nw.lastSeen.After(time.Now().Add(time.Minute * -1))
-
-		// ssid has a connection known to network manager
-		configured := nw.conn != nil
-
-		// firstSeen is reset if a network disappears for more than a minute, so retry if it comes back
-		recentlyTried := nw.firstSeen.After(nw.lastTried)
-
-		if !nw.isHotspot && visible && configured && !recentlyTried {
-			candidates = append(candidates, nw)
-		}
-	}
-	return candidates
-}
-
-func (w *NMWrapper) GetVisibleNetworks() []provisioning.NetworkInfo {
-	w.opMu.Lock()
-	defer w.opMu.Unlock()
+func (w *NMWrapper) getVisibleNetworks() []provisioning.NetworkInfo {
+	w.dataMu.Lock()
+	defer w.dataMu.Unlock()
 
 	var visible []provisioning.NetworkInfo
 	for _, nw := range w.networks {
@@ -102,6 +88,16 @@ func (w *NMWrapper) GetVisibleNetworks() []provisioning.NetworkInfo {
 	})
 
 	return visible
+}
+
+func (w *NMWrapper) getLastNetworkTried() provisioning.NetworkInfo {
+	w.dataMu.Lock()
+	defer w.dataMu.Unlock()
+	nw, ok := w.networks[w.lastSSID]
+	if !ok {
+		nw = &network{}
+	}
+	return getNetworkInfo(nw)
 }
 
 type network struct {
@@ -124,13 +120,18 @@ type network struct {
 }
 
 func getNetworkInfo(n *network) provisioning.NetworkInfo {
+	var errStr string
+	if n.lastError != nil {
+		errStr = n.lastError.Error()
+	}
+
 	return provisioning.NetworkInfo{
 		Type:      n.netType,
 		SSID:      n.ssid,
 		Security:  n.security,
 		Signal:    int32(n.signal),
 		Connected: n.connected,
-		LastError: n.lastError.Error(),
+		LastError: errStr,
 	}
 }
 
@@ -157,17 +158,17 @@ func NewNMWrapper(
 		nm:       nm,
 		settings: settings,
 		networks: make(map[string]*network),
-		state:    &connectionState{provisioningChange: time.Now()},
-	}
-
-	w.hotspotSSID = w.pCfg.HotspotPrefix + "-" + strings.ToLower(w.hostname)
-	if len(w.hotspotSSID) > 32 {
-		w.hotspotSSID = w.hotspotSSID[:32]
+		state:    &connectionState{},
 	}
 
 	w.hostname, err = settings.GetPropertyHostname()
 	if err != nil {
 		return nil, errw.Wrap(err, "error getting hostname from NetworkManager, is NetworkManager installed and enabled?")
+	}
+
+	w.hotspotSSID = w.pCfg.HotspotPrefix + "-" + strings.ToLower(w.hostname)
+	if len(w.hotspotSSID) > 32 {
+		w.hotspotSSID = w.hotspotSSID[:32]
 	}
 
 	if err := w.writeDNSMasq(); err != nil {
@@ -183,10 +184,6 @@ func NewNMWrapper(
 	}
 
 	if err = w.networkScan(ctx); err != nil {
-		return nil, err
-	}
-
-	if err = w.addHotspot(); err != nil {
 		return nil, err
 	}
 
@@ -235,8 +232,6 @@ func (w *NMWrapper) testConnCheck() error {
 }
 
 func (w *NMWrapper) initWifiDev() error {
-	w.opMu.Lock()
-	defer w.opMu.Unlock()
 	devices, err := w.nm.GetDevices()
 	if err != nil {
 		return err
@@ -280,7 +275,7 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return errw.Wrap(ctx.Err(), "error scanning wifi")
+			return nil
 		case <-time.After(time.Second):
 		}
 	}
@@ -296,8 +291,9 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 	// set "now" to be reusable for consistency
 	now := time.Now()
 	for _, ap := range wifiList {
+		//nolint:nilerr
 		if ctx.Err() != nil {
-			return errw.Wrap(ctx.Err(), "wifi scan aborted")
+			return nil
 		}
 		ssid, err := ap.GetPropertySSID()
 		if err != nil {
@@ -347,11 +343,12 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 	}
 
 	for _, nw := range w.networks {
+		//nolint:nilerr
 		if ctx.Err() != nil {
-			return errw.Wrap(ctx.Err(), "wifi scan aborted")
+			return nil
 		}
 
-		// if a network isn't visiable, reset the firstSeen time
+		// if a network isn't visible, reset the firstSeen time
 		if nw.lastSeen.Before(time.Now().Add(time.Minute * -1)) {
 			nw.firstSeen = time.Time{}
 		}
@@ -368,8 +365,9 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 	}
 
 	for _, conn := range conns {
+		//nolint:nilerr
 		if ctx.Err() != nil {
-			return errw.Wrap(ctx.Err(), "network update aborted")
+			return nil
 		}
 		settings, err := conn.GetSettings()
 		if err != nil {
@@ -377,6 +375,11 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 		}
 
 		ssid := getSSIDFromSettings(settings)
+
+		if ssid == "" {
+			// wired ethernet or some other type of connection
+			continue
+		}
 
 		// actually record the network
 		nw, ok := w.networks[ssid]
@@ -394,36 +397,11 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 	return nil
 }
 
-// adds/updates HotspotSettings, should only run after updateKnownConnections().
-func (w *NMWrapper) addHotspot() error {
-	nw, ok := w.networks[w.hotspotSSID]
-	if !ok {
-		nw = &network{isHotspot: true}
-		w.networks[w.hotspotSSID] = nw
-	}
-
-	if nw.conn == nil {
-		conn, err := w.settings.AddConnection(getSettingsHotspot(w.pCfg.HotspotPrefix, w.hotspotSSID, w.pCfg.HotspotPassword))
-		if err != nil {
-			return errw.Wrap(err, "error adding hotspot connection")
+func (w *NMWrapper) checkOnline(force bool) error {
+	if force {
+		if err := w.nm.CheckConnectivity(); err != nil {
+			w.logger.Error(err)
 		}
-		nw.conn = conn
-	} else {
-		err := nw.conn.Update(getSettingsHotspot(w.pCfg.HotspotPrefix, w.hotspotSSID, w.pCfg.HotspotPassword))
-		if err != nil {
-			return errw.Wrap(err, "error adding hotspot connection")
-		}
-	}
-	return nil
-}
-
-func (w *NMWrapper) checkOnline() error {
-	ok, err := w.nm.GetPropertyConnectivityCheckEnabled()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return errors.New("NetworkManager connectivity checking is disabled, please reinstall this subsystem")
 	}
 
 	state, err := w.nm.State()
@@ -539,31 +517,33 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context) error {
 	w.opMu.Lock()
 	defer w.opMu.Unlock()
 
-	w.dataMu.Lock()
-	defer w.dataMu.Unlock()
-
 	w.logger.Info("Starting provisioning mode.")
+	if err := w.addOrUpdateConnection(provisioning.NetworkConfig{Type: "hotspot", SSID: w.hotspotSSID}); err != nil {
+		return err
+	}
 	if err := w.activateConnection(ctx, w.hotspotSSID); err != nil {
 		return errw.Wrap(err, "error starting provisioning mode hotspot")
 	}
 
 	// start portal with ssid list and known connections
 	cp := portal.NewPortal(w.logger, BindAddr, w.pCfg)
+	w.dataMu.Lock()
 	w.cp = cp
+	w.dataMu.Unlock()
 	if err := w.cp.Run(); err != nil {
 		err = errors.Join(err, w.deactivateConnection(w.hotspotSSID))
+		w.dataMu.Lock()
 		w.cp = nil
+		w.dataMu.Unlock()
 		return errw.Wrap(err, "could not start web/grpc portal")
 	}
 
-	w.workers.Add(1)
+	w.pModeWorkers.Add(1)
 	go func() {
-		defer w.workers.Done()
-		defer func() {
-			if err := w.StopProvisioning(); err != nil {
-				w.logger.Error(err)
-			}
-		}()
+		defer w.pModeWorkers.Done()
+
+		w.logger.Debug("provisioning background loop started")
+		defer w.logger.Debug("provisioning background loop stopped")
 
 		for {
 			select {
@@ -579,6 +559,8 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context) error {
 
 			settings := cp.GetUserInput()
 			if settings == nil {
+				online, _ := w.state.getOnline()
+				cp.SetData(online, w.state.getConfigured(), w.getVisibleNetworks(), w.getLastNetworkTried())
 				continue
 			}
 
@@ -592,7 +574,7 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context) error {
 			}
 
 			if settings.SSID != "" {
-				w.logger.Debug("wifi settings received for %s", settings.SSID)
+				w.logger.Debugf("wifi settings received for %s", settings.SSID)
 				cfg := provisioning.NetworkConfig{
 					Type:     "wifi",
 					SSID:     settings.SSID,
@@ -615,21 +597,25 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context) error {
 }
 
 func (w *NMWrapper) StopProvisioning() error {
-	provisioningMode, _ := w.state.getProvisioning()
-	if !provisioningMode {
-		return errors.New("provisioning mode not yet started")
-	}
 	w.opMu.Lock()
 	defer w.opMu.Unlock()
 	w.logger.Info("Stopping provisioning mode.")
 	w.state.setProvisioning(false)
+	w.pModeWorkers.Wait()
 	var err error
+
+	w.dataMu.Lock()
 	if w.cp != nil {
 		err = w.cp.Stop()
 	}
 	w.cp = nil
+	w.dataMu.Unlock()
 
-	return errors.Join(err, w.deactivateConnection(w.hotspotSSID))
+	err2 := w.deactivateConnection(w.hotspotSSID)
+	if errors.Is(err2, ErrNoActiveConnectionFound) {
+		return err
+	}
+	return errors.Join(err, err2)
 }
 
 func (w *NMWrapper) Close() {
@@ -641,7 +627,7 @@ func (w *NMWrapper) Close() {
 			w.logger.Error(err)
 		}
 	}
-	w.workers.Wait()
+	w.monitorWorkers.Wait()
 }
 
 func (w *NMWrapper) ActivateConnection(ctx context.Context, ssid string) error {
@@ -667,6 +653,9 @@ func (w *NMWrapper) activateConnection(ctx context.Context, ssid string) error {
 	}
 
 	nw.lastTried = now
+	w.lastSSID = ssid
+
+	w.logger.Infof("Activating connection for SSID: %s", ssid)
 	activeConnection, err := w.nm.ActivateConnection(nw.conn, w.dev, nil)
 	if err != nil {
 		nw.lastError = err
@@ -685,7 +674,7 @@ func (w *NMWrapper) activateConnection(ctx context.Context, ssid string) error {
 	w.activeSSID = ssid
 
 	if ssid != w.hotspotSSID {
-		return w.checkOnline()
+		return w.checkOnline(true)
 	}
 
 	return nil
@@ -697,8 +686,10 @@ func (w *NMWrapper) deactivateConnection(ssid string) error {
 
 	nw, ok := w.networks[ssid]
 	if !ok || nw.activeConn == nil {
-		return errw.Errorf("no active connection found for ssid: %s", ssid)
+		return errw.Wrapf(ErrNoActiveConnectionFound, "ssid: %s", ssid)
 	}
+
+	w.logger.Infof("Deactivating connection for SSID: %s", ssid)
 
 	if err := w.nm.DeactivateConnection(nw.activeConn); err != nil {
 		nw.activeConn = nil
@@ -715,7 +706,7 @@ func (w *NMWrapper) deactivateConnection(ssid string) error {
 }
 
 func waitForConnect(ctx context.Context, conn gnm.ActiveConnection) error {
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*30)
+	timeoutCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
 	for {
 		state, err := conn.GetPropertyState()
@@ -740,7 +731,7 @@ func (w *NMWrapper) AddOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 }
 
 func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error {
-	if cfg.Type != "wifi" {
+	if cfg.Type != "wifi" && cfg.Type != "hotspot" {
 		return errw.Errorf("unspported network type %s, only 'wifi' currently supported", cfg.Type)
 	}
 
@@ -750,7 +741,7 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 
 	w.dataMu.Lock()
 	defer w.dataMu.Unlock()
-	settings := getSettingsWifi(w.pCfg.Manufacturer+"-"+cfg.SSID, cfg.SSID, cfg.PSK, cfg.Priority)
+
 	nw, ok := w.networks[cfg.SSID]
 	if !ok {
 		nw = &network{}
@@ -758,6 +749,26 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 	}
 
 	nw.lastTried = time.Time{}
+
+	settings := getSettingsWifi(w.pCfg.Manufacturer+"-"+cfg.SSID, cfg.SSID, cfg.PSK, cfg.Priority)
+	if cfg.Type == "hotspot" {
+		if cfg.SSID != w.hotspotSSID {
+			return errors.New("only the builtin provisioning hotspot may use the 'hotspot' network type")
+		}
+		nw.isHotspot = true
+		settings = getSettingsHotspot(w.pCfg.HotspotPrefix, w.hotspotSSID, w.pCfg.HotspotPassword)
+	}
+
+	w.logger.Infof("Adding/updating settings for SSID %s", cfg.SSID)
+
+	if nw.conn != nil {
+		if err := nw.conn.Update(settings); err != nil {
+			// we may be out of sync with NetworkManager
+			nw.conn = nil
+			w.logger.Warnf("error (%s) encountered when updating settings for %s, attempting to add as new network", err, nw.ssid)
+		}
+	}
+
 	if nw.conn == nil {
 		newConn, err := w.settings.AddConnection(settings)
 		if err != nil {
@@ -766,8 +777,7 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 		nw.conn = newConn
 		return nil
 	}
-
-	return nw.conn.Update(settings)
+	return nil
 }
 
 func (w *NMWrapper) writeDNSMasq() error {
@@ -838,38 +848,57 @@ func (w *NMWrapper) checkConfigured() {
 }
 
 // tryCandidates returns true if a network activated.
-func (w *NMWrapper) tryCandidates(ctx context.Context, candidates []*network) bool {
-	for _, nw := range candidates {
-		if err := w.activateConnection(ctx, nw.ssid); err == nil {
+func (w *NMWrapper) tryCandidates(ctx context.Context) bool {
+	for _, ssid := range w.getCandidates() {
+		if err := w.activateConnection(ctx, ssid); err == nil {
 			return true
 		}
 	}
 	return false
 }
 
+func (w *NMWrapper) getCandidates() []string {
+	w.dataMu.Lock()
+	defer w.dataMu.Unlock()
+	var candidates []string
+	for _, nw := range w.networks {
+		// ssid seen within the past minute
+		visible := nw.lastSeen.After(time.Now().Add(time.Minute * -1))
+
+		// ssid has a connection known to network manager
+		configured := nw.conn != nil
+
+		// firstSeen is reset if a network disappears for more than a minute, so retry if it comes back
+		recentlyTried := nw.lastTried.After(nw.firstSeen)
+
+		if !nw.isHotspot && visible && configured && !recentlyTried {
+			candidates = append(candidates, nw.ssid)
+		}
+	}
+	return candidates
+}
+
 func (w *NMWrapper) startStateMonitors(ctx context.Context) {
 	w.checkConfigured()
-	if err := w.checkOnline(); err != nil {
+	if err := w.checkOnline(true); err != nil {
 		w.logger.Error(err)
 	}
 	if err := w.networkScan(ctx); err != nil {
 		w.logger.Error(err)
 	}
 
-	w.workers.Add(1)
+	w.monitorWorkers.Add(1)
 	go func() {
-		defer w.workers.Done()
-		w.logger.Debug("background state monitors starting")
+		defer w.monitorWorkers.Done()
+		w.logger.Debug("background state monitors started")
+		defer w.logger.Debug("background state monitors stopped")
 		for {
-			run1 := provisioning.HealthySleep(ctx, time.Second*15)
-			run2, _ := w.state.getProvisioning()
-			if !(run1 && run2) {
-				w.logger.Debug("background state monitors stopping")
+			if !provisioning.HealthySleep(ctx, loopDelay) {
 				return
 			}
 
 			w.checkConfigured()
-			if err := w.checkOnline(); err != nil {
+			if err := w.checkOnline(false); err != nil {
 				w.logger.Error(err)
 			}
 			if err := w.networkScan(ctx); err != nil {
@@ -881,14 +910,14 @@ func (w *NMWrapper) startStateMonitors(ctx context.Context) {
 
 func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 	w.startStateMonitors(ctx)
-	loopTime := time.Second * 15
 
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(loopTime):
+			return nil
+		case <-time.After(loopDelay):
 		}
+
 		isOnline, lastOnline := w.state.getOnline()
 		isConfigured := w.state.getConfigured()
 		allGood := isOnline && isConfigured
@@ -897,42 +926,51 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 
 		w.logger.Debugf("online: %t, config_present: %t", isOnline, isConfigured)
 
-		candidates := w.getConnectionCandidates()
-
 		if pMode {
 			// complex logic, so wasting some variables for readability
+
+			// portal interaction time is updated when a user loads a page or makes a grpc request
+			// it is reset (time.IsZero()==true) when a user actually submits config data
 			inactivePortal := w.cp.GetLastInteraction().Before(now.Add(time.Minute * -5))
-			hasCandidates := len(candidates) > 0 && inactivePortal
+
+			// exit/retry to test networks only if there's no recent user interaction AND configuration is present
+			haveCandidates := len(w.getCandidates()) > 0 && inactivePortal && isConfigured
+
+			// exit/retry every ten minutes as a fallback, unless user is active
 			tenMinutes := pModeChange.Before(now.Add(time.Minute*-10)) && inactivePortal
-			shouldExit := allGood || hasCandidates || tenMinutes
+
+			shouldExit := allGood || haveCandidates || tenMinutes
 
 			if shouldExit {
 				if err := w.StopProvisioning(); err != nil {
 					w.logger.Error(err)
-					continue
+				} else {
+					pMode, pModeChange = w.state.getProvisioning()
 				}
 			}
 		}
 
 		// not in provisioning mode
-		if allGood {
+		if allGood || pMode {
 			continue
 		}
 
 		if !isOnline {
-			if w.tryCandidates(ctx, candidates) {
-				_, lastOnline = w.state.getOnline()
+			if w.tryCandidates(ctx) {
+				isOnline, lastOnline = w.state.getOnline()
+				if isOnline {
+					continue
+				}
 			}
 		}
 
 		// not in provisioning mode, so start it if not configured (/etc/viam.json)
-		// OR as long as we've been offline for at least two minutes
-		if !isConfigured || lastOnline.Before(now.Add(time.Minute*-2)) {
+		// OR as long as we've been offline for at least two minutes AND out of provisioning for two minutes
+		twoMinutesAgo := now.Add(time.Minute * -2)
+		if !isConfigured || (lastOnline.Before(twoMinutesAgo) && pModeChange.Before(twoMinutesAgo)) {
 			if err := w.StartProvisioning(ctx); err != nil {
 				w.logger.Error(err)
 			}
 		}
-
-		w.cp.GetUserInput()
 	}
 }

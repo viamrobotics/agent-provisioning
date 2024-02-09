@@ -41,6 +41,7 @@ type CaptivePortal struct {
 }
 
 type deviceStatus struct {
+	banner           string
 	lastNetwork      provisioning.NetworkInfo
 	visibleNetworks  []provisioning.NetworkInfo
 	online           bool
@@ -48,8 +49,12 @@ type deviceStatus struct {
 	errors           []error
 }
 
-// SMURF TODO add machine/model/fragment info to display.
 type templateData struct {
+	Manufacturer string
+	Model        string
+	FragmentID   string
+
+	Banner       string
 	LastNetwork  provisioning.NetworkInfo
 	VisibleSSIDs []provisioning.NetworkInfo
 	Errors       []string
@@ -142,6 +147,8 @@ func (cp *CaptivePortal) GetUserInput() *provisioning.UserInput {
 		if time.Now().After(input.Updated.Add(time.Second*10)) || (input.SSID != "" && input.PartID != "") {
 			cp.input = &provisioning.UserInput{}
 			cp.inputRecieved.Store(false)
+			// reset last interaction time since user seems to be done providing input
+			cp.lastInteraction = time.Time{}
 			return input
 		}
 	}
@@ -184,6 +191,10 @@ func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 	cp.lastInteraction = time.Now()
 
 	data := templateData{
+		Manufacturer: cp.factory.Manufacturer,
+		Model:        cp.factory.Model,
+		FragmentID:   cp.factory.FragmentID,
+		Banner:       cp.status.banner,
 		LastNetwork:  cp.status.lastNetwork,
 		VisibleSSIDs: cp.status.visibleNetworks,
 		IsOnline:     cp.status.online,
@@ -211,7 +222,8 @@ func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 
-	// reset the errors, as they were now just displayed
+	// reset the errors and banner, as they were now just displayed
+	cp.status.banner = ""
 	cp.status.errors = nil
 }
 
@@ -254,13 +266,15 @@ func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			cp.input.RawConfig = rawConfig
-			cp.logger.Debugf("saving raw device config")
+			cp.logger.Debug("saving raw device config")
+			cp.status.banner = "Saving device config. "
 		}
 
 		if ssid != "" {
 			cp.input.SSID = ssid
 			cp.input.PSK = psk
 			cp.logger.Debugf("saving credentials for %s", cp.input.SSID)
+			cp.status.banner += "Added credentials for SSID: " + cp.input.SSID
 		}
 
 		cp.input.Updated = time.Now()
