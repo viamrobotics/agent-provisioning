@@ -101,7 +101,7 @@ Provisioning mode will start a hotspot when either not configured (no /etc/viam.
 If there is no `/etc/viam.json` present, the captive portal will also require you to paste the content of the viam-server config to use in `/etc/viam.json` This can be copied from the "Setup" tab of your machine in https://app.viam.com by clicking the "Copy viam-server configuration" button near the top right.
 
 ### Mobile App
-If using the Viam mobile app, and your device has been pre-installed with the agent (per above) you can use it to configure your robot, instead of the captive web portal. See the mobile app documentation for details.
+If using the Viam mobile app, and your device has been pre-installed with the agent (per above) you can use it to configure your robot, instead of the captive web portal. Within the [Viam mobile app](https://docs.viam.com/fleet/#the-viam-mobile-app) navigate to an organization, then to a location, then inside any location tap "Add new smart machine", and follow the instructions in app. See the mobile app documentation for further details.
 
 ### Test CLI Utility
 There is a simple CLI client available to test the GRPC components of the provisioning service. Run `go run ./cmd/client/` for info.
