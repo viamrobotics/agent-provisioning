@@ -81,6 +81,9 @@ issues:
         - exhaustive
         - goconst
         - gosec
+    - path: ^cmd/client/
+      linters:
+        - forbidigo
   exclude-use-default: false
   max-per-linter: 0
   max-same-issues: 0

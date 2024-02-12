@@ -3,86 +3,156 @@ package portal
 
 import (
 	"embed"
+	"encoding/json"
 	"errors"
 	"html/template"
+	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	errw "github.com/pkg/errors"
 	"go.uber.org/zap"
+	pb "go.viam.com/api/provisioning/v1"
+	"google.golang.org/grpc"
+
+	provisioning "github.com/viamrobotics/agent-provisioning"
 )
 
 type CaptivePortal struct {
 	logger *zap.SugaredLogger
 
+	bindAddr   string
+	server     *http.Server
+	grpcServer *grpc.Server
+
+	factory *provisioning.ProvisioningConfig
+
 	mu              sync.Mutex
 	lastInteraction time.Time
-	server          *http.Server
-	visibleSSIDs    []string
-	savedSSIDs      []string
-	lastError       error
+	input           *provisioning.UserInput
+	inputRecieved   atomic.Bool
+	status          *deviceStatus
 
-	ssid string
-	psk  string
-
-	inputRecieved atomic.Bool
-	workers       sync.WaitGroup
+	workers sync.WaitGroup
+	pb.UnimplementedProvisioningServiceServer
 }
 
-type TemplateData struct {
-	SSID string
+type deviceStatus struct {
+	banner           string
+	lastNetwork      provisioning.NetworkInfo
+	visibleNetworks  []provisioning.NetworkInfo
+	online           bool
+	deviceConfigured bool
+	errors           []error
+}
 
-	VisibleSSIDs []string
-	KnownSSIDs   []string
-	LastError    string
+type templateData struct {
+	Manufacturer string
+	Model        string
+	FragmentID   string
+
+	Banner       string
+	LastNetwork  provisioning.NetworkInfo
+	VisibleSSIDs []provisioning.NetworkInfo
+	Errors       []string
+	IsConfigured bool
+	IsOnline     bool
 }
 
 //go:embed templates/*
 var templates embed.FS
 
-func NewPortal(logger *zap.SugaredLogger, bindAddr string) *CaptivePortal {
+func NewPortal(logger *zap.SugaredLogger, bindAddr string, factoryCfg provisioning.ProvisioningConfig) *CaptivePortal {
 	mux := http.NewServeMux()
-	cp := &CaptivePortal{logger: logger, server: &http.Server{Addr: bindAddr, Handler: mux, ReadTimeout: time.Second * 10}}
+	cp := &CaptivePortal{
+		bindAddr: bindAddr,
+		logger:   logger,
+		server: &http.Server{
+			Addr:        bindAddr + ":80",
+			Handler:     mux,
+			ReadTimeout: time.Second * 10,
+		},
+		factory: &factoryCfg,
+		input:   &provisioning.UserInput{},
+		status:  &deviceStatus{},
+	}
 	mux.HandleFunc("/", cp.index)
 	mux.HandleFunc("/save", cp.saveWifi)
 	return cp
 }
 
-func (cp *CaptivePortal) Run() {
+func (cp *CaptivePortal) Run() error {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	if err := cp.startGRPC(); err != nil {
+		return errw.Wrap(err, "error starting GRPC service")
+	}
+
+	if err := cp.startWeb(); err != nil {
+		return errw.Wrap(err, "error starting web portal service")
+	}
+
+	return nil
+}
+
+func (cp *CaptivePortal) startWeb() error {
+	bind := cp.bindAddr + ":80"
+	lis, err := net.Listen("tcp", bind)
+	if err != nil {
+		return errw.Wrapf(err, "error listening on: %s", bind)
+	}
+
 	cp.workers.Add(1)
 	go func() {
 		defer cp.workers.Done()
-		err := cp.server.ListenAndServe()
+		err := cp.server.Serve(lis)
 		if !errors.Is(err, http.ErrServerClosed) {
 			cp.logger.Error(err)
 		}
 	}()
+	return nil
 }
 
 func (cp *CaptivePortal) Stop() error {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
-	err := cp.server.Close()
-	cp.ssid = ""
-	cp.psk = ""
+
+	if cp.grpcServer != nil {
+		cp.grpcServer.Stop()
+		cp.grpcServer = nil
+	}
+
+	var err error
+	if cp.server != nil {
+		err = cp.server.Close()
+	}
+
+	cp.input = &provisioning.UserInput{}
 	cp.inputRecieved.Store(false)
+
 	return err
 }
 
-func (cp *CaptivePortal) GetUserInput() (string, string, bool) {
-	ok := cp.inputRecieved.Load()
-	if ok {
+func (cp *CaptivePortal) GetUserInput() *provisioning.UserInput {
+	if cp.inputRecieved.Load() {
 		cp.mu.Lock()
 		defer cp.mu.Unlock()
-		ssid := cp.ssid
-		psk := cp.psk
-		cp.ssid = ""
-		cp.psk = ""
-		cp.inputRecieved.Store(false)
-		return ssid, psk, ok
+		input := cp.input
+		// in case both network and device credentials are being updated
+		// only send user data after we've had it for ten seconds or if both are already set
+		if time.Now().After(input.Updated.Add(time.Second*10)) || (input.SSID != "" && input.PartID != "") {
+			cp.input = &provisioning.UserInput{}
+			cp.inputRecieved.Store(false)
+			// reset last interaction time since user seems to be done providing input
+			cp.lastInteraction = time.Time{}
+			return input
+		}
 	}
-	return "", "", ok
+	return nil
 }
 
 func (cp *CaptivePortal) GetLastInteraction() time.Time {
@@ -91,12 +161,22 @@ func (cp *CaptivePortal) GetLastInteraction() time.Time {
 	return cp.lastInteraction
 }
 
-func (cp *CaptivePortal) SetData(visibleSSIDs, savedSSIDs []string, lastError error) {
+func (cp *CaptivePortal) AppendErrors(errs ...error) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
-	cp.visibleSSIDs = visibleSSIDs
-	cp.savedSSIDs = savedSSIDs
-	cp.lastError = lastError
+	cp.status.errors = append(cp.status.errors, errs...)
+}
+
+func (cp *CaptivePortal) SetData(online, configured bool,
+	networks []provisioning.NetworkInfo,
+	lastTry provisioning.NetworkInfo,
+) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	cp.status.online = online
+	cp.status.deviceConfigured = configured
+	cp.status.visibleNetworks = networks
+	cp.status.lastNetwork = lastTry
 }
 
 func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
@@ -107,21 +187,33 @@ func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	cp.mu.Lock()
+	defer cp.mu.Unlock()
 	cp.lastInteraction = time.Now()
-	data := TemplateData{
-		SSID:         cp.ssid,
-		VisibleSSIDs: cp.visibleSSIDs,
-		KnownSSIDs:   cp.savedSSIDs,
-	}
-	if cp.lastError != nil {
-		data.LastError = cp.lastError.Error()
-	}
-	cp.mu.Unlock()
 
-	t, err := template.ParseFS(templates, "templates/base.html", "templates/index.html")
+	data := templateData{
+		Manufacturer: cp.factory.Manufacturer,
+		Model:        cp.factory.Model,
+		FragmentID:   cp.factory.FragmentID,
+		Banner:       cp.status.banner,
+		LastNetwork:  cp.status.lastNetwork,
+		VisibleSSIDs: cp.status.visibleNetworks,
+		IsOnline:     cp.status.online,
+		IsConfigured: cp.status.deviceConfigured,
+		Errors:       cp.errListAsStrings(),
+	}
+
+	t, err := template.ParseFS(templates, "templates/*.html")
 	if err != nil {
 		cp.logger.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+
+	if os.Getenv("VIAM_AGENT_DEVMODE") != "" {
+		cp.logger.Warn("devmode enabled, using templates from /opt/viam/tmp/templates/")
+		newT, err := template.ParseGlob("/opt/viam/tmp/templates/*.html")
+		if err == nil {
+			t = newT
+		}
 	}
 
 	err = t.Execute(w, data)
@@ -129,6 +221,10 @@ func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
 		cp.logger.Error(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+
+	// reset the errors and banner, as they were now just displayed
+	cp.status.banner = ""
+	cp.status.errors = nil
 }
 
 func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
@@ -141,12 +237,47 @@ func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		cp.mu.Lock()
 		defer cp.mu.Unlock()
+		defer http.Redirect(w, r, "/", http.StatusSeeOther)
 		cp.lastInteraction = time.Now()
-		cp.ssid = r.FormValue("ssid")
-		cp.psk = r.FormValue("password")
-		cp.logger.Debugf("saving credentials for %s", cp.ssid)
+
+		ssid := r.FormValue("ssid")
+		psk := r.FormValue("password")
+		rawConfig := r.FormValue("viamconfig")
+
+		if ssid == "" && !cp.status.online {
+			cp.status.errors = append(cp.status.errors, errors.New("no SSID provided"))
+			return
+		}
+
+		if rawConfig == "" && !cp.status.deviceConfigured {
+			cp.status.errors = append(cp.status.errors, errors.New("no device config provided"))
+			return
+		}
+
+		if rawConfig != "" {
+			// we'll check if the config is valid, but NOT use the parsed config, in case additional fields on in the json
+			cfg := &provisioning.DeviceConfig{}
+			if err := json.Unmarshal([]byte(rawConfig), cfg); err != nil {
+				cp.status.errors = append(cp.status.errors, errw.Wrap(err, "invalid json config contents"))
+				return
+			}
+			if cfg.Cloud.ID == "" || cfg.Cloud.Secret == "" || cfg.Cloud.AppAddress == "" {
+				cp.status.errors = append(cp.status.errors, errors.New("incomplete cloud config provided"))
+				return
+			}
+			cp.input.RawConfig = rawConfig
+			cp.logger.Debug("saving raw device config")
+			cp.status.banner = "Saving device config. "
+		}
+
+		if ssid != "" {
+			cp.input.SSID = ssid
+			cp.input.PSK = psk
+			cp.logger.Debugf("saving credentials for %s", cp.input.SSID)
+			cp.status.banner += "Added credentials for SSID: " + cp.input.SSID
+		}
+
+		cp.input.Updated = time.Now()
 		cp.inputRecieved.Store(true)
 	}
-
-	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
