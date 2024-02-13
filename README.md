@@ -56,6 +56,13 @@ Example `/etc/viam-provisioning.json`
 * hotspot_password: Defaults to `viamsetup`
   * Wifi password for provisioning hotspot.
 
+## Mobile App Provisioning
+If using the Viam mobile app, and your device has been pre-installed with the agent (per above steps) you can use it to configure your robot, instead of the captive web portal. 
+
+### Steps in Viam mobile app
+Download the Viam mobile app from [Apple App Store](https://apps.apple.com/vn/app/viam-robotics/id6451424162) or [Google Play](https://play.google.com/store/apps/details?id=com.viam.viammobile&hl=en&gl=US).
+
+Within the [Viam mobile app](https://docs.viam.com/fleet/#the-viam-mobile-app) once logged in, navigate to an organization, then to a location, then inside any location tap "Add new smart machine", and follow the instructions in app. See the mobile app documentation for further details.
 
 ## User Configuration
 No configuration is neccessary for normal end-user use. Provisioning mode will start a hotspot when either not configured (no /etc/viam.json) or not online.
@@ -99,9 +106,6 @@ Provisioning mode will start a hotspot when either not configured (no /etc/viam.
 
 ### Pre-installed provisioning
 If there is no `/etc/viam.json` present, the captive portal will also require you to paste the content of the viam-server config to use in `/etc/viam.json` This can be copied from the "Setup" tab of your machine in https://app.viam.com by clicking the "Copy viam-server configuration" button near the top right.
-
-### Mobile App
-If using the Viam mobile app, and your device has been pre-installed with the agent (per above) you can use it to configure your robot, instead of the captive web portal. Within the [Viam mobile app](https://docs.viam.com/fleet/#the-viam-mobile-app) navigate to an organization, then to a location, then inside any location tap "Add new smart machine", and follow the instructions in app. See the mobile app documentation for further details.
 
 ### Test CLI Utility
 There is a simple CLI client available to test the GRPC components of the provisioning service. Run `go run ./cmd/client/` for info.
