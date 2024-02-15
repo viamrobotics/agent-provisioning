@@ -57,7 +57,7 @@ Example `/etc/viam-provisioning.json`
   * Wifi password for provisioning hotspot.
 
 ## Mobile App Provisioning
-If using the Viam mobile app, and your device has been pre-installed with the agent (per above steps) you can use it to configure your robot, instead of the captive web portal. 
+If you are using the Viam mobile app, and your device has been pre-installed with the agent (per above steps) you can use the mobile app to configure your robot, instead of the captive web portal. 
 
 ### Steps in Viam mobile app
 Download the Viam mobile app from [Apple App Store](https://apps.apple.com/vn/app/viam-robotics/id6451424162) or [Google Play](https://play.google.com/store/apps/details?id=com.viam.viammobile&hl=en&gl=US).
