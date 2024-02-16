@@ -4,16 +4,35 @@ This is a subsystem (plugin) for the viam-agent that provides network (wifi) man
 ## Installation
 This will be automatically installed for online devices (robots) that are using the agent. See install instructions at https://github.com/viamrobotics/agent
 
-It should work "out of the box" on Debian Bookworm or newer. For Bullseye, it's neccessary to switch the network configuration to using NetworkManager first. `sudo raspi-config` and then navigate `Advanced Options`>`Network Config`>`NetworkManager` (this will be automated soon.)
+It should work "out of the box" on Debian Bookworm or newer. For Bullseye, it's neccessary to switch the network configuration to using NetworkManager first. `sudo raspi-config` and then navigate `Advanced Options`>`Network Config`>`NetworkManager` Note that this is automatically handled for new installs using the main agent's install.sh script.
 
 
-### Offline/pre-installation
-Scripted and more detailed documentation coming soon.
+## Offline/pre-installation
+NOTE: This is for preinstallation on images/sd cards. If you have a live system, use the main agent installer linked at the top of this page.
 
-Note: This is not typically needed by end users.
+### Short version (For Raspberry Pi)
+Flash a 64-bit image to your SD card using the Raspberry Pi Imager, and customize at least the hostname when prompted. Eject and reinsert the card to make sure it's mounted with the newly written contents. Then simply run the following script.
 
-To manually install (without configuring the device):
+```
+sudo /bin/sh -c "$(curl -fsSL https://storage.googleapis.com/packages.viam.com/apps/viam-agent/preinstall.sh)"
+```
 
+## Preinstall Details
+We provide a preinstall script that can auto-detect some common (Raspberry Pi ands similar) mounted images, but it can also be used to locally generate a tarball package you can extract yourself or you can manually specify the image root (if it's not a mountpoint of its own.) Please note this script works only under POSIX (MacOS and Linux) at the moment. If you make use of this, you may want to also look at [Factory/Manufacturer Configuration](#factorymanufacturer-configuration) below as well.
+
+[Download from here](https://storage.googleapis.com/packages.viam.com/apps/viam-agent/preinstall.sh) and make the script executable `chmod 755 preinstall.sh`
+
+Running it without options `sudo ./preinstall.sh` will attempt to auto-detect a mounted root filesystem (or for Raspberry Pi, bootfs) and also automatically determine the architecture.
+
+If you want to just create a tarball you can extract on your own, use one of the following:
+
+`sudo ./preinstall.sh --aarch64` for an arm64 package
+OR
+`sudo ./preinstall.sh --x86_64` for an amd64 package
+
+Lastly, if the script cannot detect your mountpoint, you can specify it directly. Ex: `sudo ./preinstall.sh /path/to/rootfs`
+
+### Manual install
 1. Create directories `/opt/viam/bin/` and  `/opt/viam/tmp`
 1. Download/copy the viam-agent and viam-agent-provisioning binaries into `/opt/viam/tmp`
 1. Symlink the agent binary to `bin/viam-agent`
