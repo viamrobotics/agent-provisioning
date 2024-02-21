@@ -15,7 +15,7 @@ import (
 	"github.com/jessevdk/go-flags"
 	errw "github.com/pkg/errors"
 
-	"github.com/viamrobotics/agent-provisioning"
+	provisioning "github.com/viamrobotics/agent-provisioning"
 	netman "github.com/viamrobotics/agent-provisioning/networkmanager"
 )
 
@@ -75,8 +75,8 @@ func main() {
 	}
 
 	// If user settings override the hotspot password, use that instead
-	if cfg.HotspotPassword != "" {
-		pCfg.HotspotPassword = cfg.HotspotPassword
+	if pCfg.HotspotPassword != "" {
+		cfg.HotspotPassword = pCfg.HotspotPassword
 	}
 
 	nm, err := netman.NewNMWrapper(ctx, log, pCfg, opts.AppConfig)
