@@ -35,6 +35,7 @@ Lastly, if the script cannot detect your mountpoint, you can specify it directly
 ### Manual install
 1. Create directories `/opt/viam/bin/` and  `/opt/viam/tmp`
 1. Download/copy the viam-agent and viam-agent-provisioning binaries into `/opt/viam/tmp`
+1. Make sure they are marked as executable (if downloaded from the web) `chmod 755 /opt/viam/tmp/viam-agent*`
 1. Symlink the agent binary to `bin/viam-agent`
     * Note: On this and subsequent symlink operations, be sure to use relative symlinks, especially if working on a mounted image or otherwise non-live system
 1. Symlink the provisioning binary to `bin/agent-provisioning`
