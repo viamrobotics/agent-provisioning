@@ -45,3 +45,8 @@ bin/golangci-lint:
 lint: bin/golangci-lint
 	go mod tidy
 	bin/golangci-lint run -v --fix
+
+.PHONY: upload-stable
+upload-stable: bin/viam-agent-provisioning-$(PATH_VERSION)-x86_64 bin/viam-agent-provisioning-$(PATH_VERSION)-aarch64 bin/viam-agent-provisioning-stable-x86_64 bin/viam-agent-provisioning-stable-aarch64
+	test "$(PATH_VERSION)" != "custom"
+	gsutil -h "Cache-Control:no-cache" cp bin/viam-agent-provisioning-$(PATH_VERSION)-x86_64 bin/viam-agent-provisioning-$(PATH_VERSION)-aarch64 bin/viam-agent-provisioning-stable-x86_64 bin/viam-agent-provisioning-stable-aarch64 gs://packages.viam.com/apps/viam-agent-provisioning/

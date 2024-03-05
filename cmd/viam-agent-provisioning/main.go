@@ -27,9 +27,6 @@ var (
 )
 
 func main() {
-	ctx := setupExitSignalHandling()
-	defer activeBackgroundWorkers.Wait()
-
 	//nolint:lll
 	var opts struct {
 		Config             string `default:"/opt/viam/etc/agent-provisioning.json" description:"Path to config file"                              long:"config"       short:"c"`
@@ -44,7 +41,9 @@ func main() {
 	parser.Usage = "runs as a background service and manages updates and the process lifecycle for viam-server."
 
 	_, err := parser.Parse()
-	exitIfError(err)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	if opts.Help {
 		var b bytes.Buffer
@@ -63,6 +62,9 @@ func main() {
 	if opts.Debug {
 		log = golog.NewDebugLogger("agent-provisioning")
 	}
+
+	ctx := setupExitSignalHandling()
+	defer activeBackgroundWorkers.Wait()
 
 	pCfg, err := provisioning.LoadProvisioningConfig(opts.ProvisioningConfig)
 	if err != nil {
@@ -126,7 +128,7 @@ func setupExitSignalHandling() context.Context {
 			case syscall.SIGABRT:
 				fallthrough
 			case syscall.SIGTERM:
-				log.Info("exiting")
+				log.Info("exit signal received")
 				signal.Ignore(os.Interrupt, syscall.SIGTERM, syscall.SIGABRT) // keeping SIGQUIT for stack trace debugging
 				return
 
@@ -149,10 +151,4 @@ func setupExitSignalHandling() context.Context {
 
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGABRT, syscall.SIGUSR1)
 	return ctx
-}
-
-func exitIfError(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
 }
