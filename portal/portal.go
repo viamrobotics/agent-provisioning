@@ -81,6 +81,7 @@ func NewPortal(logger *zap.SugaredLogger, bindAddr string, factoryCfg provisioni
 	}
 	mux.HandleFunc("/", cp.index)
 	mux.HandleFunc("/save", cp.saveWifi)
+	mux.HandleFunc("/setup", cp.setup)
 	return cp
 }
 
@@ -180,6 +181,37 @@ func (cp *CaptivePortal) SetData(online, configured bool,
 }
 
 func (cp *CaptivePortal) index(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if err := r.Body.Close(); err != nil {
+			cp.logger.Error(err)
+		}
+	}()
+
+	if cp.factory.DisableDNSRedirect {
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+	} else {
+		cp.logger.Debug("returning captive portal json")
+
+		w.Header().Set("Content-Type", "application/captive+json")
+		w.Header().Set("Cache-Control", "private")
+		w.WriteHeader(http.StatusOK)
+
+		responseBody := `{
+            "captive": true,
+            "user-portal-url": "http://viam.setup/setup",
+            "seconds-remaining": 3600,
+            "can-extend-session": true
+        }`
+
+		_, err := w.Write([]byte(responseBody))
+		if err != nil {
+			cp.logger.Error(err)
+		}
+
+	}
+}
+
+func (cp *CaptivePortal) setup(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if err := r.Body.Close(); err != nil {
 			cp.logger.Error(err)
