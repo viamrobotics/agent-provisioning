@@ -3,6 +3,7 @@ package portal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"time"
 
@@ -72,7 +73,11 @@ func (cp *CaptivePortal) SetNetworkCredentials(ctx context.Context,
 	cp.input.Updated = time.Now()
 	cp.input.SSID = req.GetSsid()
 	cp.input.PSK = req.GetPsk()
-	cp.inputRecieved.Store(true)
+	cp.inputReceived.Store(true)
+
+	if req.GetSsid() == cp.status.lastNetwork.SSID {
+		cp.status.lastNetwork.LastError = ""
+	}
 
 	return &pb.SetNetworkCredentialsResponse{}, nil
 }
@@ -93,7 +98,7 @@ func (cp *CaptivePortal) SetSmartMachineCredentials(ctx context.Context,
 	cp.input.PartID = cloud.GetId()
 	cp.input.Secret = cloud.GetSecret()
 	cp.input.AppAddr = cloud.GetAppAddress()
-	cp.inputRecieved.Store(true)
+	cp.inputReceived.Store(true)
 
 	return &pb.SetSmartMachineCredentialsResponse{}, nil
 }
@@ -115,9 +120,14 @@ func (cp *CaptivePortal) GetNetworkList(ctx context.Context,
 }
 
 func (cp *CaptivePortal) errListAsStrings() []string {
-	errList := make([]string, len(cp.status.errors))
-	for i, err := range cp.status.errors {
-		errList[i] = err.Error()
+	errList := []string{}
+
+	if cp.status.lastNetwork.LastError != "" {
+		errList = append(errList, fmt.Sprintf("SSID: %s: %s", cp.status.lastNetwork.SSID, cp.status.lastNetwork.LastError))
+	}
+
+	for _, err := range cp.status.errors {
+		errList = append(errList, err.Error())
 	}
 	return errList
 }
