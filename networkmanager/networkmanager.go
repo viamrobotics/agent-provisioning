@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	gnm "github.com/Wifx/gonetworkmanager/v2"
+	gnm "github.com/Otterverse/gonetworkmanager/v2"
 	"github.com/google/uuid"
 	errw "github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -35,12 +35,12 @@ const (
 var (
 	BindAddr = "10.42.0.1"
 	// older networkmanager requires unit32 arrays for IP addresses.
-	IPAsUint32                    = binary.LittleEndian.Uint32([]byte{10, 42, 0, 1})
-	ErrCouldNotActivateConnection = errors.New("could not activate connection")
-	ErrConnCheckDisabled          = errors.New("NetworkManager connectivity checking disabled by user, network management will be unavailable")
-	ErrNoActiveConnectionFound    = errors.New("no active connection found")
-	loopDelay                     = time.Second * 15
-	connectTimeout                = time.Second * 30
+	IPAsUint32                 = binary.LittleEndian.Uint32([]byte{10, 42, 0, 1})
+	ErrBadPassword             = errors.New("bad or missing password")
+	ErrConnCheckDisabled       = errors.New("NetworkManager connectivity checking disabled by user, network management will be unavailable")
+	ErrNoActiveConnectionFound = errors.New("no active connection found")
+	loopDelay                  = time.Second * 15
+	connectTimeout             = time.Second * 50 // longer than the 45 second timeout in NetworkManager
 )
 
 type NMWrapper struct {
@@ -506,7 +506,7 @@ func getSettingsHotspot(id, ssid, psk string) gnm.ConnectionSettings {
 }
 
 // StartProvisioning puts the wifi in hotspot mode and starts a captive portal.
-func (w *NMWrapper) StartProvisioning(ctx context.Context) error {
+func (w *NMWrapper) StartProvisioning(ctx context.Context, userInputChan chan struct{}) error {
 	provisioningMode, _ := w.state.getProvisioning()
 	if provisioningMode {
 		return errors.New("provisioning mode already started")
@@ -587,6 +587,9 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context) error {
 					continue
 				}
 			}
+
+			// signal that the user sent stuff so we can break the main loop
+			userInputChan <- struct{}{}
 		}
 	}()
 
@@ -651,7 +654,9 @@ func (w *NMWrapper) activateConnection(ctx context.Context, ssid string) error {
 	}
 
 	nw.lastTried = now
-	w.lastSSID = ssid
+	if ssid != w.hotspotSSID {
+		w.lastSSID = ssid
+	}
 
 	w.logger.Infof("Activating connection for SSID: %s", ssid)
 	activeConnection, err := w.nm.ActivateConnection(nw.conn, w.dev, nil)
@@ -660,7 +665,7 @@ func (w *NMWrapper) activateConnection(ctx context.Context, ssid string) error {
 		return errw.Wrapf(err, "error activating connection for ssid: %s", ssid)
 	}
 
-	if err := waitForConnect(ctx, activeConnection); err != nil {
+	if err := w.waitForConnect(ctx); err != nil {
 		nw.lastError = err
 		return err
 	}
@@ -703,21 +708,37 @@ func (w *NMWrapper) deactivateConnection(ssid string) error {
 	return nil
 }
 
-func waitForConnect(ctx context.Context, conn gnm.ActiveConnection) error {
+func (w *NMWrapper) waitForConnect(ctx context.Context) error {
 	timeoutCtx, cancel := context.WithTimeout(ctx, connectTimeout)
 	defer cancel()
+
+	changeChan := make(chan gnm.DeviceStateChange, 32)
+	exitChan := make(chan struct{})
+	defer close(exitChan)
+
+	if err := w.dev.SubscribeState(changeChan, exitChan); err != nil {
+		return errw.Wrap(err, "monitoring connection activation")
+	}
+
 	for {
-		state, err := conn.GetPropertyState()
-		if err != nil {
-			// dbus errors are useless here, as when the connection fails, the object just goes away
-			// so we report our own instead
-			return ErrCouldNotActivateConnection
-		}
-		if state == gnm.NmActiveConnectionStateActivated {
-			return nil
-		}
-		if !provisioning.HealthySleep(timeoutCtx, time.Second) {
-			return errors.Join(err, ErrCouldNotActivateConnection)
+		select {
+		case update := <-changeChan:
+			w.logger.Debugf("%s->%s (%s)", update.OldState, update.NewState, update.Reason)
+			//nolint:exhaustive
+			switch update.NewState {
+			case gnm.NmDeviceStateActivated:
+				return nil
+			case gnm.NmDeviceStateFailed:
+				if update.Reason == gnm.NmDeviceStateReasonNoSecrets {
+					return ErrBadPassword
+				}
+				// custom error if it's some other reason for failure
+				return errw.Errorf("connection failed: %s", update.Reason)
+			default:
+			}
+
+		case <-timeoutCtx.Done():
+			return errw.Wrap(ctx.Err(), "waiting for network activation")
 		}
 	}
 }
@@ -909,10 +930,19 @@ func (w *NMWrapper) startStateMonitors(ctx context.Context) {
 func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 	w.startStateMonitors(ctx)
 
+	userInputChan := make(chan struct{}, 1)
+	var userInputReceived bool
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-userInputChan:
+			userInputReceived = true
+			// wait 3 seconds so responses can be sent to/seen by user
+			if !provisioning.HealthySleep(ctx, time.Second*3) {
+				return nil
+			}
 		case <-time.After(loopDelay):
 		}
 
@@ -928,8 +958,7 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 			// complex logic, so wasting some variables for readability
 
 			// portal interaction time is updated when a user loads a page or makes a grpc request
-			// it is reset (time.IsZero()==true) when a user actually submits config data
-			inactivePortal := w.cp.GetLastInteraction().Before(now.Add(time.Minute * -5))
+			inactivePortal := w.cp.GetLastInteraction().Before(now.Add(time.Minute*-5)) || userInputReceived
 
 			// exit/retry to test networks only if there's no recent user interaction AND configuration is present
 			haveCandidates := len(w.getCandidates()) > 0 && inactivePortal && isConfigured
@@ -943,16 +972,16 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 				if err := w.StopProvisioning(); err != nil {
 					w.logger.Error(err)
 				} else {
-					pMode, pModeChange = w.state.getProvisioning()
+					pMode, _ = w.state.getProvisioning()
 				}
 			}
 		}
 
-		// not in provisioning mode
 		if allGood || pMode {
 			continue
 		}
 
+		// not in provisioning mode
 		if !isOnline {
 			if w.tryCandidates(ctx) {
 				isOnline, lastOnline = w.state.getOnline()
@@ -963,10 +992,10 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 		}
 
 		// not in provisioning mode, so start it if not configured (/etc/viam.json)
-		// OR as long as we've been offline for at least two minutes AND out of provisioning for two minutes
+		// OR as long as we've been offline for at least two minutes
 		twoMinutesAgo := now.Add(time.Minute * -2)
-		if !isConfigured || (lastOnline.Before(twoMinutesAgo) && pModeChange.Before(twoMinutesAgo)) {
-			if err := w.StartProvisioning(ctx); err != nil {
+		if !isConfigured || (lastOnline.Before(twoMinutesAgo)) {
+			if err := w.StartProvisioning(ctx, userInputChan); err != nil {
 				w.logger.Error(err)
 			}
 		}

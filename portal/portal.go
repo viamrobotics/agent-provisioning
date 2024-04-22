@@ -33,7 +33,7 @@ type CaptivePortal struct {
 	mu              sync.Mutex
 	lastInteraction time.Time
 	input           *provisioning.UserInput
-	inputRecieved   atomic.Bool
+	inputReceived   atomic.Bool
 	status          *deviceStatus
 
 	workers sync.WaitGroup
@@ -132,23 +132,24 @@ func (cp *CaptivePortal) Stop() error {
 	}
 
 	cp.input = &provisioning.UserInput{}
-	cp.inputRecieved.Store(false)
+	cp.inputReceived.Store(false)
 
 	return err
 }
 
 func (cp *CaptivePortal) GetUserInput() *provisioning.UserInput {
-	if cp.inputRecieved.Load() {
+	if cp.inputReceived.Load() {
 		cp.mu.Lock()
 		defer cp.mu.Unlock()
 		input := cp.input
 		// in case both network and device credentials are being updated
 		// only send user data after we've had it for ten seconds or if both are already set
-		if time.Now().After(input.Updated.Add(time.Second*10)) || (input.SSID != "" && input.PartID != "") {
+		if time.Now().After(input.Updated.Add(time.Second*10)) ||
+			(input.SSID != "" && input.PartID != "") ||
+			(input.SSID != "" && cp.status.deviceConfigured) ||
+			(input.PartID != "" && cp.status.online) {
 			cp.input = &provisioning.UserInput{}
-			cp.inputRecieved.Store(false)
-			// reset last interaction time since user seems to be done providing input
-			cp.lastInteraction = time.Time{}
+			cp.inputReceived.Store(false)
 			return input
 		}
 	}
@@ -277,7 +278,10 @@ func (cp *CaptivePortal) saveWifi(w http.ResponseWriter, r *http.Request) {
 			cp.status.banner += "Added credentials for SSID: " + cp.input.SSID
 		}
 
+		if ssid == cp.status.lastNetwork.SSID {
+			cp.status.lastNetwork.LastError = ""
+		}
 		cp.input.Updated = time.Now()
-		cp.inputRecieved.Store(true)
+		cp.inputReceived.Store(true)
 	}
 }
