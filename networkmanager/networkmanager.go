@@ -992,9 +992,9 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 		}
 
 		// not in provisioning mode, so start it if not configured (/etc/viam.json)
-		// OR as long as we've been offline for at least two minutes
-		twoMinutesAgo := now.Add(time.Minute * -2)
-		if !isConfigured || (lastOnline.Before(twoMinutesAgo)) {
+		// OR as long as we've been offline for at least 12 hours
+		twelveHoursAgo := now.Add(time.Hour * -12)
+		if !isConfigured || (lastOnline.Before(twelveHoursAgo)) {
 			if err := w.StartProvisioning(ctx, userInputChan); err != nil {
 				w.logger.Error(err)
 			}
