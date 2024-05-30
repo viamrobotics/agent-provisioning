@@ -57,7 +57,7 @@ type NMWrapper struct {
 	cp       *portal.CaptivePortal
 	hostname string
 	logger   *zap.SugaredLogger
-	pCfg     provisioning.ProvisioningConfig
+	pCfg     provisioning.Config
 	cfgPath  string
 
 	// internal locking
@@ -105,6 +105,7 @@ type network struct {
 	ssid      string
 	security  string
 	signal    uint8
+	priority  int
 	isHotspot bool
 
 	firstSeen time.Time
@@ -138,7 +139,7 @@ func getNetworkInfo(n *network) provisioning.NetworkInfo {
 func NewNMWrapper(
 	ctx context.Context,
 	logger *zap.SugaredLogger,
-	pCfg *provisioning.ProvisioningConfig,
+	pCfg *provisioning.Config,
 	cfgPath string,
 ) (*NMWrapper, error) {
 	nm, err := gnm.NewNetworkManager()
@@ -386,6 +387,7 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 			w.networks[ssid] = nw
 		}
 		nw.conn = conn
+		nw.priority = getPriorityFromSettings(settings)
 
 		if ssid == w.hotspotSSID {
 			nw.isHotspot = true
@@ -395,6 +397,7 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 	return nil
 }
 
+// SMURF TODO logic around this for single mode.
 func (w *NMWrapper) checkOnline(force bool) error {
 	if force {
 		if err := w.nm.CheckConnectivity(); err != nil {
@@ -424,6 +427,24 @@ func (w *NMWrapper) checkOnline(force bool) error {
 
 	w.state.setOnline(online)
 	return err
+}
+
+func getPriorityFromSettings(settings gnm.ConnectionSettings) int {
+	connection, ok := settings["connection"]
+	if !ok {
+		return 0
+	}
+
+	priRaw, ok := connection["autoconnect-priority"]
+	if !ok {
+		return 0
+	}
+
+	priority, ok := priRaw.(int)
+	if !ok {
+		return 0
+	}
+	return priority
 }
 
 func getSSIDFromSettings(settings gnm.ConnectionSettings) string {
@@ -571,13 +592,19 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, userInputChan chan st
 				}
 			}
 
+			// 999 indicates primary network in single-network (normal) mode
+			netPriority := 999
+			if w.pCfg.RoamingMode {
+				netPriority = 100
+			}
+
 			if settings.SSID != "" {
 				w.logger.Debugf("wifi settings received for %s", settings.SSID)
 				cfg := provisioning.NetworkConfig{
 					Type:     "wifi",
 					SSID:     settings.SSID,
 					PSK:      settings.PSK,
-					Priority: 100,
+					Priority: netPriority,
 				}
 
 				err := w.AddOrUpdateConnection(cfg)
@@ -778,6 +805,11 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 		settings = getSettingsHotspot(w.pCfg.HotspotPrefix, w.hotspotSSID, w.pCfg.HotspotPassword)
 	}
 
+	if !w.pCfg.RoamingMode {
+		// lower the priority of any existing/prior primary network
+		w.lowerMaxNetPriorities(cfg.SSID)
+	}
+
 	w.logger.Infof("Adding/updating settings for SSID %s", cfg.SSID)
 
 	if nw.conn != nil {
@@ -799,6 +831,32 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 	return nil
 }
 
+// this doesn't error as it's not technically fatal if it fails.
+func (w *NMWrapper) lowerMaxNetPriorities(skip string) {
+	for ssid, nw := range w.networks {
+		if ssid == skip || ssid == w.hotspotSSID || nw.priority < 999 {
+			continue
+		}
+
+		if nw.conn != nil {
+			settings, err := nw.conn.GetSettings()
+			if err != nil {
+				nw.conn = nil
+				w.logger.Warnf("error (%s) encountered when getting settings for %s", err, nw.ssid)
+				continue
+			}
+
+			if getPriorityFromSettings(settings) == 999 {
+				settings["connection"]["autoconnect-priority"] = 998
+				if err := nw.conn.Update(settings); err != nil {
+					nw.conn = nil
+					w.logger.Warnf("error (%s) encountered when updating settings for %s", err, nw.ssid)
+				}
+			}
+			nw.priority = 998
+		}
+	}
+}
 func (w *NMWrapper) writeDNSMasq() error {
 	DNSMasqContents := DNSMasqContentsRedirect
 	if w.pCfg.DisableDNSRedirect {
@@ -958,13 +1016,13 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 			// complex logic, so wasting some variables for readability
 
 			// portal interaction time is updated when a user loads a page or makes a grpc request
-			inactivePortal := w.cp.GetLastInteraction().Before(now.Add(time.Minute*-5)) || userInputReceived
+			inactivePortal := w.cp.GetLastInteraction().Before(now.Add(time.Duration(w.pCfg.UserTimeout)*-1)) || userInputReceived
 
 			// exit/retry to test networks only if there's no recent user interaction AND configuration is present
 			haveCandidates := len(w.getCandidates()) > 0 && inactivePortal && isConfigured
 
-			// exit/retry every ten minutes as a fallback, unless user is active
-			tenMinutes := pModeChange.Before(now.Add(time.Minute*-10)) && inactivePortal
+			// exit/retry every FallbackTimeout (10 minute default), unless user is active
+			tenMinutes := pModeChange.Before(now.Add(time.Duration(w.pCfg.FallbackTimeout)*-1)) && inactivePortal
 
 			shouldExit := allGood || haveCandidates || tenMinutes
 
@@ -992,9 +1050,8 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 		}
 
 		// not in provisioning mode, so start it if not configured (/etc/viam.json)
-		// OR as long as we've been offline for at least two minutes
-		twoMinutesAgo := now.Add(time.Minute * -2)
-		if !isConfigured || (lastOnline.Before(twoMinutesAgo)) {
+		// OR as long as we've been offline for at least OfflineTimeout (2 minute default)
+		if !isConfigured || (lastOnline.Before(now.Add(time.Duration(w.pCfg.OfflineTimeout) * -1))) {
 			if err := w.StartProvisioning(ctx, userInputChan); err != nil {
 				w.logger.Error(err)
 			}

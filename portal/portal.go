@@ -28,7 +28,7 @@ type CaptivePortal struct {
 	server     *http.Server
 	grpcServer *grpc.Server
 
-	factory *provisioning.ProvisioningConfig
+	factory *provisioning.Config
 
 	mu              sync.Mutex
 	lastInteraction time.Time
@@ -65,7 +65,7 @@ type templateData struct {
 //go:embed templates/*
 var templates embed.FS
 
-func NewPortal(logger *zap.SugaredLogger, bindAddr string, factoryCfg provisioning.ProvisioningConfig) *CaptivePortal {
+func NewPortal(logger *zap.SugaredLogger, bindAddr string, factoryCfg provisioning.Config) *CaptivePortal {
 	mux := http.NewServeMux()
 	cp := &CaptivePortal{
 		bindAddr: bindAddr,

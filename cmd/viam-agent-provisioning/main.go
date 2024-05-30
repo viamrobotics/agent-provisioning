@@ -66,19 +66,16 @@ func main() {
 	ctx := setupExitSignalHandling()
 	defer activeBackgroundWorkers.Wait()
 
-	pCfg, err := provisioning.LoadProvisioningConfig(opts.ProvisioningConfig)
+	// Manufacturer settings from agent-provisioning.json
+	pCfg, err := provisioning.LoadConfig(provisioning.DefaultConf, opts.ProvisioningConfig)
 	if err != nil {
 		log.Error(errw.Wrapf(err, "error loading %s, using defaults", opts.ProvisioningConfig))
 	}
 
-	cfg, err := provisioning.LoadConfig(opts.Config)
+	// User settings from the "attributes" section of the cloud config (passed from parent agent via json file)
+	cfg, err := provisioning.LoadConfig(*pCfg, opts.Config)
 	if err != nil {
-		log.Warn(err)
-	}
-
-	// If user settings override the hotspot password, use that instead
-	if cfg.HotspotPassword != "" {
-		pCfg.HotspotPassword = cfg.HotspotPassword
+		log.Error(errw.Wrapf(err, "error loading %s, using defaults", opts.Config))
 	}
 
 	nm, err := netman.NewNMWrapper(ctx, log, pCfg, opts.AppConfig)
