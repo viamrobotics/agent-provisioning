@@ -89,7 +89,7 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 			w.networks[ssid] = nw
 		}
 
-		nw.netType = "wifi"
+		nw.netType = NetworkTypeWifi
 		nw.ssid = ssid
 		nw.security = parseWPAFlags(apFlags, wpaFlags, rsnFlags)
 		nw.signal = signal

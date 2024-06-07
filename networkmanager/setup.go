@@ -15,7 +15,7 @@ import (
 
 func (w *NMWrapper) writeDNSMasq() error {
 	DNSMasqContents := DNSMasqContentsRedirect
-	if w.pCfg.DisableDNSRedirect {
+	if w.cfg.DisableDNSRedirect {
 		DNSMasqContents = DNSMasqContentsSetupOnly
 	}
 

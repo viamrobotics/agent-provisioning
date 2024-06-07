@@ -3,14 +3,17 @@ package networkmanager
 import (
 	"encoding/binary"
 	"errors"
+	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gnm "github.com/Otterverse/gonetworkmanager/v2"
 	"go.uber.org/zap"
+	pb "go.viam.com/api/provisioning/v1"
+	"google.golang.org/grpc"
 
 	provisioning "github.com/viamrobotics/agent-provisioning"
-	"github.com/viamrobotics/agent-provisioning/portal"
 )
 
 // This file contains type, const, and var definitions.
@@ -22,6 +25,9 @@ const (
 
 	ConnCheckFilepath = "/etc/NetworkManager/conf.d/80-viam.conf"
 	ConnCheckContents = "[connectivity]\nuri=http://packages.viam.com/check_network_status.txt\ninterval=300\n"
+
+	NetworkTypeWifi    = "wifi"
+	NetworkTypeHotspot = "hotspot"
 )
 
 var (
@@ -36,21 +42,20 @@ var (
 )
 
 type NMWrapper struct {
-	monitorWorkers sync.WaitGroup
-	pModeWorkers   sync.WaitGroup
+	monitorWorkers      sync.WaitGroup
+	provisioningWorkers sync.WaitGroup
 
 	// blocks start/stop/etc operations
 	opMu sync.Mutex
 
 	// only set during NewNMWrapper, no lock
-	nm       gnm.NetworkManager
-	dev      gnm.DeviceWireless
-	settings gnm.Settings
-	cp       *portal.CaptivePortal
-	hostname string
-	logger   *zap.SugaredLogger
-	pCfg     provisioning.Config
-	cfgPath  string
+	nm          gnm.NetworkManager
+	dev         gnm.DeviceWireless
+	settings    gnm.Settings
+	hostname    string
+	logger      *zap.SugaredLogger
+	cfg         provisioning.Config
+	viamCfgPath string
 
 	// internal locking
 	state *connectionState
@@ -61,6 +66,16 @@ type NMWrapper struct {
 	hotspotSSID string
 	activeSSID  string
 	lastSSID    string
+	errors      []error
+
+	// portal
+	webServer  *http.Server
+	grpcServer *grpc.Server
+
+	input         *provisioning.UserInput
+	inputReceived atomic.Bool
+	banner        string
+	pb.UnimplementedProvisioningServiceServer
 }
 
 type network struct {

@@ -100,7 +100,7 @@ type CloudConfig struct {
 	Secret     string `json:"secret"`
 }
 
-func WriteDeviceConfig(file string, input *UserInput) error {
+func WriteDeviceConfig(file string, input UserInput) error {
 	if input.RawConfig != "" {
 		return os.WriteFile(file, []byte(input.RawConfig), 0o600)
 	}
