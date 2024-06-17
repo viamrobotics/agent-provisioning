@@ -48,7 +48,6 @@ func (w *NMWrapper) startWeb() error {
 	mux.HandleFunc("/", w.portalIndex)
 	mux.HandleFunc("/save", w.portalSave)
 	w.webServer = &http.Server{
-		// SMURF DELETE IF SAFE Addr:        BindAddr + ":80",
 		Handler:     mux,
 		ReadTimeout: time.Second * 10,
 	}

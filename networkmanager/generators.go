@@ -7,7 +7,7 @@ import (
 
 // This file contains the wifi/hotspot setting generation functions.
 
-func generateWifiSettings(id, ssid, psk string, priority int) gnm.ConnectionSettings {
+func generateWifiSettings(id, ssid, psk string, priority int32) gnm.ConnectionSettings {
 	settings := gnm.ConnectionSettings{
 		"connection": map[string]interface{}{
 			"id":                   id,

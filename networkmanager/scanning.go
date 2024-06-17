@@ -49,37 +49,37 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 	// set "now" to be reusable for consistency
 	now := time.Now()
 	for _, ap := range wifiList {
-		//nolint:nilerr
 		if ctx.Err() != nil {
+			//nolint:nilerr
 			return nil
 		}
 		ssid, err := ap.GetPropertySSID()
 		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
+			w.logger.Warn(errw.Wrap(err, "scanning wifi"))
 			continue
 		}
 
 		signal, err := ap.GetPropertyStrength()
 		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
+			w.logger.Warn(errw.Wrap(err, "scanning wifi"))
 			continue
 		}
 
 		apFlags, err := ap.GetPropertyFlags()
 		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
+			w.logger.Warn(errw.Wrap(err, "scanning wifi"))
 			continue
 		}
 
 		wpaFlags, err := ap.GetPropertyWPAFlags()
 		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
+			w.logger.Warn(errw.Wrap(err, "scanning wifi"))
 			continue
 		}
 
 		rsnFlags, err := ap.GetPropertyRSNFlags()
 		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
+			w.logger.Warn(errw.Wrap(err, "scanning wifi"))
 			continue
 		}
 
@@ -101,8 +101,8 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 	}
 
 	for _, nw := range w.networks {
-		//nolint:nilerr
 		if ctx.Err() != nil {
+			//nolint:nilerr
 			return nil
 		}
 
@@ -187,7 +187,7 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 	return nil
 }
 
-func getPriorityFromSettings(settings gnm.ConnectionSettings) int {
+func getPriorityFromSettings(settings gnm.ConnectionSettings) int32 {
 	connection, ok := settings["connection"]
 	if !ok {
 		return 0
@@ -198,7 +198,7 @@ func getPriorityFromSettings(settings gnm.ConnectionSettings) int {
 		return 0
 	}
 
-	priority, ok := priRaw.(int)
+	priority, ok := priRaw.(int32)
 	if !ok {
 		return 0
 	}

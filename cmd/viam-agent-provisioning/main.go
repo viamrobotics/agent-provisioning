@@ -78,7 +78,7 @@ func main() {
 		log.Error(errw.Wrapf(err, "error loading %s, using defaults", opts.Config))
 	}
 
-	nm, err := netman.NewNMWrapper(ctx, log, pCfg, opts.AppConfig)
+	nm, err := netman.NewNMWrapper(ctx, log, cfg, opts.AppConfig)
 	if err != nil {
 		log.Error(err)
 		return
@@ -87,7 +87,7 @@ func main() {
 
 	for _, network := range cfg.Networks {
 		log.Debugf("adding/updating NetworkManager configuration for %s", network.SSID)
-		if err := nm.AddOrUpdateConnection(network); err != nil {
+		if _, err := nm.AddOrUpdateConnection(network); err != nil {
 			log.Error(errw.Wrapf(err, "error adding network %s", network.SSID))
 		}
 	}

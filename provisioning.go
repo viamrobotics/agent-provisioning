@@ -86,7 +86,7 @@ type NetworkConfig struct {
 	Type     string `json:"type"`
 	SSID     string `json:"ssid"`
 	PSK      string `json:"psk"`
-	Priority int    `json:"priority"`
+	Priority int32  `json:"priority"`
 }
 
 // DeviceConfig represents the minimal needed for /etc/viam.json.

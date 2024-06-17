@@ -126,10 +126,11 @@ func (w *NMWrapper) GetNetworkList(ctx context.Context,
 }
 
 func (w *NMWrapper) errListAsStrings() []string {
-	lastNetwork := w.networks[w.lastSSID]
 	errList := []string{}
 
-	if lastNetwork.lastError != nil {
+	lastNetwork, ok := w.networks[w.lastSSID]
+
+	if ok && lastNetwork.lastError != nil {
 		errList = append(errList, fmt.Sprintf("SSID: %s: %s", lastNetwork.ssid, lastNetwork.lastError))
 	}
 

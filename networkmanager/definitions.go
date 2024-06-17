@@ -83,7 +83,7 @@ type network struct {
 	ssid      string
 	security  string
 	signal    uint8
-	priority  int
+	priority  int32
 	isHotspot bool
 
 	firstSeen time.Time
