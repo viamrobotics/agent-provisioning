@@ -3,6 +3,8 @@ package networkmanager
 import (
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 type connectionState struct {
@@ -20,11 +22,18 @@ type connectionState struct {
 	provisioningChange time.Time
 
 	lastInteraction time.Time
+
+	logger *zap.SugaredLogger
 }
 
 func (c *connectionState) setOnline(online bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.online != online {
+		c.logger.Infof("Online: %t", online)
+	}
+
 	c.online = online
 	if online {
 		c.lastOnline = time.Now()
@@ -46,6 +55,11 @@ func (c *connectionState) getLastOnline() time.Time {
 func (c *connectionState) setConnected(connected bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.connected != connected {
+		c.logger.Infof("Wifi Connected: %t", connected)
+	}
+
 	c.connected = connected
 	if connected {
 		c.lastConnected = time.Now()
@@ -67,6 +81,11 @@ func (c *connectionState) getLastConnected() time.Time {
 func (c *connectionState) setConfigured(configured bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.configured != configured {
+		c.logger.Infof("Viam Server Configured: %t", configured)
+	}
+
 	c.configured = configured
 }
 

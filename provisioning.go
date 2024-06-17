@@ -156,9 +156,24 @@ func LoadConfig(defaultConf Config, path string) (*Config, error) {
 		return &defaultConf, errw.New("values in configs/attributes should not be empty, please omit empty fields entirely")
 	}
 
-	// SMURF TODO: figure out individual min/max timeouts allowed
-	if conf.OfflineTimeout < minTimeout || conf.UserTimeout < minTimeout || conf.FallbackTimeout < minTimeout {
-		return &defaultConf, errw.New("timeout values cannot be less than 15 seconds")
+	var haveBadTimeout bool
+	if conf.OfflineTimeout < minTimeout {
+		conf.OfflineTimeout = defaultConf.OfflineTimeout
+		haveBadTimeout = true
+	}
+
+	if conf.UserTimeout < minTimeout {
+		conf.UserTimeout = defaultConf.UserTimeout
+		haveBadTimeout = true
+	}
+
+	if conf.FallbackTimeout < minTimeout {
+		conf.FallbackTimeout = defaultConf.FallbackTimeout
+		haveBadTimeout = true
+	}
+
+	if haveBadTimeout {
+		return &conf, errw.Errorf("timeout values cannot be less than %s", time.Duration(minTimeout))
 	}
 
 	return &conf, nil
@@ -178,10 +193,6 @@ type Config struct {
 	// If true, mobile (phone) users connecting to the hotspot won't be automatically redirected to the web portal.
 	DisableDNSRedirect bool `json:"disable_dns_redirect"`
 
-	// When true, will try all known networks looking for internet (global) connectivity.
-	// Otherwise, will only try the primary wifi network and consider that sufficient if connected (regardless of global connectivity.)
-	RoamingMode bool `json:"roaming_mode"`
-
 	// How long without a connection before starting provisioning (hotspot) mode.
 	OfflineTimeout Timeout `json:"offline_timeout"`
 
@@ -191,7 +202,11 @@ type Config struct {
 	// If not "online", always drop out of hotspot mode and retry everything after this time limit.
 	FallbackTimeout Timeout `json:"fallback_timeout"`
 
-	// Additional networks to always add/configure.
+	// When true, will try all known networks looking for internet (global) connectivity.
+	// Otherwise, will only try the primary wifi network and consider that sufficient if connected (regardless of global connectivity.)
+	RoamingMode bool `json:"roaming_mode"`
+
+	// Additional networks to add/configure. Only useful in RoamingMode.
 	Networks []NetworkConfig `json:"networks"`
 }
 
@@ -263,5 +278,14 @@ func HealthySleep(ctx context.Context, timeout time.Duration) bool {
 		case <-time.After(timeout):
 			return true
 		}
+	}
+}
+
+func Sleep(ctx context.Context, timeout time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(timeout):
+		return true
 	}
 }

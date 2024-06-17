@@ -41,7 +41,7 @@ func NewNMWrapper(
 		nm:          nm,
 		settings:    settings,
 		networks:    make(map[string]*network),
-		state:       &connectionState{},
+		state:       &connectionState{logger: logger},
 		input:       &provisioning.UserInput{},
 	}
 
@@ -67,7 +67,11 @@ func NewNMWrapper(
 		return nil, err
 	}
 
-	if err = w.networkScan(ctx); err != nil {
+	w.checkConfigured()
+	if err := w.networkScan(ctx); err != nil {
+		return nil, err
+	}
+	if err := w.checkConnection(); err != nil {
 		return nil, err
 	}
 
@@ -202,7 +206,7 @@ func (w *NMWrapper) checkConnection() error {
 }
 
 // StartProvisioning puts the wifi in hotspot mode and starts a captive portal.
-func (w *NMWrapper) StartProvisioning(ctx context.Context, userInputChan chan provisioning.UserInput) error {
+func (w *NMWrapper) StartProvisioning(ctx context.Context) error {
 	if w.state.getProvisioning() {
 		return errors.New("provisioning mode already started")
 	}
@@ -224,35 +228,8 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, userInputChan chan pr
 		return errw.Wrap(err, "could not start web/grpc portal")
 	}
 
-	w.provisioningWorkers.Add(1)
-	go w.provisioningBackgroundLoop(ctx, userInputChan)
-
 	w.state.setProvisioning(true)
 	return nil
-}
-
-func (w *NMWrapper) provisioningBackgroundLoop(ctx context.Context, userInputChan chan provisioning.UserInput) {
-	defer w.provisioningWorkers.Done()
-
-	w.logger.Debug("provisioning background loop started")
-	defer w.logger.Debug("provisioning background loop stopped")
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(time.Second):
-		}
-
-		if !w.state.getProvisioning() {
-			return
-		}
-
-		settings := w.GetUserInput()
-		if settings != nil {
-			userInputChan <- *settings
-		}
-	}
 }
 
 func (w *NMWrapper) StopProvisioning() error {
@@ -313,6 +290,8 @@ func (w *NMWrapper) activateConnection(ctx context.Context, ssid string) error {
 	nw.lastError = nil
 	w.activeSSID = ssid
 
+	w.logger.Infof("Successfully activated connection for SSID: %s", ssid)
+
 	if ssid != w.hotspotSSID {
 		w.state.setConnected(true)
 		return w.checkOnline(true)
@@ -337,6 +316,8 @@ func (w *NMWrapper) deactivateConnection(ssid string) error {
 		nw.lastError = err
 		return errw.Wrapf(err, "error deactivating connection for ssid: %s", ssid)
 	}
+
+	w.logger.Infof("Successfully deactivated connection for SSID: %s", ssid)
 
 	w.state.setConnected(false)
 	nw.connected = false
@@ -469,6 +450,11 @@ func (w *NMWrapper) lowerMaxNetPriorities(skip string) {
 
 			if getPriorityFromSettings(settings) == 999 {
 				settings["connection"]["autoconnect-priority"] = 998
+
+				// deprecated fields that are read-only, so can't try to set them
+				delete(settings["ipv6"], "addresses")
+				delete(settings["ipv6"], "routes")
+
 				if err := nw.conn.Update(settings); err != nil {
 					nw.conn = nil
 					w.logger.Warnf("error (%s) encountered when updating settings for %s", err, nw.ssid)
@@ -487,10 +473,23 @@ func (w *NMWrapper) checkConfigured() {
 // tryCandidates returns true if a network activated.
 func (w *NMWrapper) tryCandidates(ctx context.Context) bool {
 	for _, ssid := range w.getCandidates() {
-		// SMURF add debug logging around this
-		if err := w.activateConnection(ctx, ssid); err == nil {
+		err := w.activateConnection(ctx, ssid)
+		if err != nil {
+			w.logger.Error(err)
+			continue
+		}
+
+		// in single mode we just need a connection
+		if !w.cfg.RoamingMode {
 			return true
 		}
+
+		// in roaming mode we need full internet
+		if w.state.getOnline() {
+			return true
+		}
+
+		w.logger.Warnf("SSID %s connected, but does not provide internet access.", ssid)
 	}
 	return false
 }
@@ -509,29 +508,21 @@ func (w *NMWrapper) getCandidates() []string {
 		// firstSeen is reset if a network disappears for more than a minute, so retry if it comes back (or generally after 10 minutes)
 		recentlyTried := nw.lastTried.After(nw.firstSeen) && nw.lastTried.After(time.Now().Add(time.Duration(w.cfg.FallbackTimeout)*-1))
 
-		// if we're not roaming, the only valid candidate is the primary network
-		if !w.cfg.RoamingMode {
-			if visible && configured && nw.priority == 999 && !recentlyTried {
-				return []string{nw.ssid}
-			}
-			continue
-		}
-
-		if !nw.isHotspot && visible && configured && !recentlyTried {
+		// must be either roaming mode OR priority 999 (in single mode)
+		if !nw.isHotspot && visible && configured && !recentlyTried && (w.cfg.RoamingMode || nw.priority == 999) {
 			candidates = append(candidates, nw.ssid)
 		}
 	}
+
+	// this shouldn't happen without external network manipulation, but it's non-fatal, so just warn
+	if !w.cfg.RoamingMode && len(candidates) > 1 {
+		w.logger.Warnf("Multiple networks have highest (999) priority. Selection will be arbitrary.")
+	}
+
 	return candidates
 }
 
 func (w *NMWrapper) startStateMonitors(ctx context.Context) {
-	w.checkConfigured()
-	if err := w.networkScan(ctx); err != nil {
-		w.logger.Error(err)
-	}
-	if err := w.checkConnection(); err != nil {
-		w.logger.Error(err)
-	}
 	if err := w.checkOnline(true); err != nil {
 		w.logger.Error(err)
 	}
@@ -539,10 +530,10 @@ func (w *NMWrapper) startStateMonitors(ctx context.Context) {
 	w.monitorWorkers.Add(1)
 	go func() {
 		defer w.monitorWorkers.Done()
-		w.logger.Debug("background state monitors started")
-		defer w.logger.Debug("background state monitors stopped")
+		w.logger.Info("Background state monitors started")
+		defer w.logger.Info("Background state monitors stopped")
 		for {
-			if !provisioning.HealthySleep(ctx, loopDelay) {
+			if !provisioning.Sleep(ctx, scanLoopDelay) {
 				return
 			}
 
@@ -563,17 +554,17 @@ func (w *NMWrapper) startStateMonitors(ctx context.Context) {
 func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 	w.startStateMonitors(ctx)
 
-	userInputChan := make(chan provisioning.UserInput, 1)
 	var userInputReceived bool
 
 	for {
-		select {
-		case <-ctx.Done():
+		if !provisioning.HealthySleep(ctx, mainLoopDelay) {
 			return nil
-		case userInput := <-userInputChan:
+		}
+		userInput := w.GetUserInput()
+		if userInput != nil {
 			if userInput.RawConfig != "" || userInput.PartID != "" {
-				w.logger.Debug("device config received")
-				err := provisioning.WriteDeviceConfig(w.viamCfgPath, userInput)
+				w.logger.Info("Device config received")
+				err := provisioning.WriteDeviceConfig(w.viamCfgPath, *userInput)
 				if err != nil {
 					w.dataMu.Lock()
 					w.errors = append(w.errors, err)
@@ -588,7 +579,7 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 			var newSSID string
 			var newNetwork bool
 			if userInput.SSID != "" {
-				w.logger.Debugf("wifi settings received for %s", userInput.SSID)
+				w.logger.Infof("Wifi settings received for %s", userInput.SSID)
 				priority := int32(999)
 				if w.cfg.RoamingMode {
 					priority = 100
@@ -635,20 +626,20 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 					w.dataMu.Lock()
 					nw, ok := w.networks[newSSID]
 					if ok {
-						// add a user warning, and set the last tried time directly, to prevent auto-connection attempts later in the loop
-						nw.lastError = errw.New("Network has no internet. Resubmit to use anyway.")
-						nw.lastTried = time.Now()
+						// add a user warning for the portal
+						err = errw.New("Network has no internet. Resubmit to use anyway.")
+						nw.lastError = err
+						w.logger.Warn(err)
 					} else {
 						w.logger.Error("cannot find ssid %s in network list", newSSID)
 					}
 					w.dataMu.Unlock()
-					err = w.StartProvisioning(ctx, userInputChan)
+					err = w.StartProvisioning(ctx)
 					if err != nil {
 						w.logger.Error(err)
 					}
 				}
 			}
-		case <-time.After(loopDelay):
 		}
 
 		isOnline := w.state.getOnline()
@@ -683,9 +674,11 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 			haveCandidates := len(w.getCandidates()) > 0 && inactivePortal && isConfigured
 
 			// exit/retry every FallbackTimeout (10 minute default), unless user is active
-			tenMinutes := pModeChange.Before(now.Add(time.Duration(w.cfg.FallbackTimeout)*-1)) && inactivePortal
+			fallbackHit := pModeChange.Before(now.Add(time.Duration(w.cfg.FallbackTimeout)*-1)) && inactivePortal
 
-			shouldExit := allGood || haveCandidates || tenMinutes
+			shouldExit := allGood || haveCandidates || fallbackHit
+
+			w.logger.Debugf("inactive portal: %t, have candidates: %t, fallback timeout: %t", inactivePortal, haveCandidates, fallbackHit)
 
 			if shouldExit {
 				if err := w.StopProvisioning(); err != nil {
@@ -721,7 +714,7 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 		// not in provisioning mode, so start it if not configured (/etc/viam.json)
 		// OR as long as we've been offline for at least OfflineTimeout (2 minute default)
 		if !isConfigured || lastConnectivity.Before(now.Add(time.Duration(w.cfg.OfflineTimeout)*-1)) {
-			if err := w.StartProvisioning(ctx, userInputChan); err != nil {
+			if err := w.StartProvisioning(ctx); err != nil {
 				w.logger.Error(err)
 			}
 		}

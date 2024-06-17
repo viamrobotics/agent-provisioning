@@ -33,7 +33,7 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 		if lastScan > prevScan {
 			break
 		}
-		if !provisioning.HealthySleep(ctx, time.Second) {
+		if !provisioning.Sleep(ctx, time.Second) {
 			return nil
 		}
 	}

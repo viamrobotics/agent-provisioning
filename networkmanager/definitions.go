@@ -37,7 +37,8 @@ var (
 	ErrBadPassword             = errors.New("bad or missing password")
 	ErrConnCheckDisabled       = errors.New("NetworkManager connectivity checking disabled by user, network management will be unavailable")
 	ErrNoActiveConnectionFound = errors.New("no active connection found")
-	loopDelay                  = time.Second * 15
+	mainLoopDelay              = time.Second * 1
+	scanLoopDelay              = time.Second * 15
 	connectTimeout             = time.Second * 50 // longer than the 45 second timeout in NetworkManager
 )
 

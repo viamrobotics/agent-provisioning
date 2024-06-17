@@ -85,8 +85,11 @@ func main() {
 	}
 	defer nm.Close()
 
+	if !cfg.RoamingMode && len(cfg.Networks) > 0 {
+		log.Warn("Additional networks configured, but Roaming Mode is not enabled. Additional wifi networks will likely be unused.")
+	}
+
 	for _, network := range cfg.Networks {
-		log.Debugf("adding/updating NetworkManager configuration for %s", network.SSID)
 		if _, err := nm.AddOrUpdateConnection(network); err != nil {
 			log.Error(errw.Wrapf(err, "error adding network %s", network.SSID))
 		}
