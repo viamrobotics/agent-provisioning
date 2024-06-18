@@ -47,6 +47,7 @@ type NMWrapper struct {
 	provisioningWorkers sync.WaitGroup
 
 	// blocks start/stop/etc operations
+	// holders of this lock must use HealthySleep to respond to HealthChecks from the parent agent during long operations
 	opMu sync.Mutex
 
 	// only set during NewNMWrapper, no lock
@@ -67,6 +68,7 @@ type NMWrapper struct {
 	hotspotSSID string
 	activeSSID  string
 	lastSSID    string
+	primarySSID string
 	errors      []error
 
 	// portal

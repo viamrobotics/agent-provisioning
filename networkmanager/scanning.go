@@ -13,7 +13,10 @@ import (
 	provisioning "github.com/viamrobotics/agent-provisioning"
 )
 
-func (w *NMWrapper) networkScan(ctx context.Context) error {
+func (w *NMWrapper) NetworkScan(ctx context.Context) error {
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+
 	prevScan, err := w.dev.GetPropertyLastScan()
 	if err != nil {
 		return errw.Wrap(err, "error scanning wifi")
@@ -33,7 +36,7 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 		if lastScan > prevScan {
 			break
 		}
-		if !provisioning.Sleep(ctx, time.Second) {
+		if !provisioning.HealthySleep(ctx, time.Second) {
 			return nil
 		}
 	}
@@ -85,7 +88,10 @@ func (w *NMWrapper) networkScan(ctx context.Context) error {
 
 		nw, ok := w.networks[ssid]
 		if !ok {
-			nw = &network{}
+			nw = &network{
+				netType: NetworkTypeWifi,
+				ssid:    ssid,
+			}
 			w.networks[ssid] = nw
 		}
 
@@ -153,6 +159,7 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 		return err
 	}
 
+	var highestPriority int32
 	for _, conn := range conns {
 		//nolint:nilerr
 		if ctx.Err() != nil {
@@ -173,13 +180,22 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 		// actually record the network
 		nw, ok := w.networks[ssid]
 		if !ok {
-			nw = &network{}
+			nw = &network{
+				netType: NetworkTypeWifi,
+				ssid:    ssid,
+			}
 			w.networks[ssid] = nw
 		}
 		nw.conn = conn
 		nw.priority = getPriorityFromSettings(settings)
 
-		if ssid == w.hotspotSSID {
+		if nw.priority > highestPriority {
+			highestPriority = nw.priority
+			w.primarySSID = nw.ssid
+		}
+
+		if nw.ssid == w.hotspotSSID {
+			nw.netType = NetworkTypeHotspot
 			nw.isHotspot = true
 		}
 	}

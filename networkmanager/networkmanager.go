@@ -68,10 +68,19 @@ func NewNMWrapper(
 	}
 
 	w.checkConfigured()
-	if err := w.networkScan(ctx); err != nil {
+	if err := w.NetworkScan(ctx); err != nil {
 		return nil, err
 	}
-	if err := w.checkConnection(); err != nil {
+
+	w.warnIfMultiplePrimaryNetworks()
+
+	if w.cfg.RoamingMode {
+		w.logger.Info("Roaming Mode enabled. Will try all connections for global internet connectivity.")
+	} else {
+		w.logger.Infof("Default (Single Network) Mode enabled. Will directly connect only to primary network: %s", w.primarySSID)
+	}
+
+	if err := w.CheckConnection(); err != nil {
 		return nil, err
 	}
 
@@ -86,6 +95,31 @@ func (w *NMWrapper) Close() {
 		}
 	}
 	w.monitorWorkers.Wait()
+}
+
+func (w *NMWrapper) warnIfMultiplePrimaryNetworks() {
+	if w.cfg.RoamingMode {
+		return
+	}
+	w.dataMu.Lock()
+	defer w.dataMu.Unlock()
+	var primaryCandidates []string
+	highestPriority := int32(-999)
+	for _, nw := range w.networks {
+		if nw.priority > highestPriority {
+			highestPriority = nw.priority
+			primaryCandidates = []string{nw.ssid}
+		} else if nw.priority == highestPriority {
+			primaryCandidates = append(primaryCandidates, nw.ssid)
+		}
+	}
+	if len(primaryCandidates) > 1 {
+		w.logger.Warnf(
+			"Multiple networks %s tied for highest priority (%d), selection will be arbitrary. Consider using Roaming Mode.",
+			primaryCandidates,
+			highestPriority,
+		)
+	}
 }
 
 func (w *NMWrapper) getVisibleNetworks() []provisioning.NetworkInfo {
@@ -143,9 +177,14 @@ func (w *NMWrapper) checkOnline(force bool) error {
 	return err
 }
 
-func (w *NMWrapper) checkConnection() error {
+func (w *NMWrapper) CheckConnection() error {
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
 	var connected bool
 	defer func() {
+		if connected && w.activeSSID != "" {
+			w.logger.Debugf("Connected to: %s", w.activeSSID)
+		}
 		w.state.setConnected(connected)
 	}()
 
@@ -171,8 +210,9 @@ func (w *NMWrapper) checkConnection() error {
 	ssid := getSSIDFromSettings(settings)
 
 	w.dataMu.Lock()
-	w.activeSSID = ssid
 	defer w.dataMu.Unlock()
+
+	w.activeSSID = ssid
 	activeNetwork, ok := w.networks[w.activeSSID]
 	if !ok {
 		err := errw.Errorf("active network not found in network list: %s", w.activeSSID)
@@ -197,8 +237,8 @@ func (w *NMWrapper) checkConnection() error {
 		return nil
 	}
 
-	// in normal (single) mode, we need to be connected to the priority 999 network
-	if state == gnm.NmActiveConnectionStateActivated && getPriorityFromSettings(settings) == 999 {
+	// in normal (single) mode, we need to be connected to the primary (highest priority) network
+	if state == gnm.NmActiveConnectionStateActivated && w.activeSSID == w.primarySSID {
 		connected = true
 	}
 
@@ -409,6 +449,7 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) (bool,
 	if !w.cfg.RoamingMode && cfg.Priority == 999 {
 		// lower the priority of any existing/prior primary network
 		w.lowerMaxNetPriorities(cfg.SSID)
+		w.primarySSID = cfg.SSID
 	}
 
 	w.logger.Infof("Adding/updating settings for SSID %s", cfg.SSID)
@@ -455,12 +496,14 @@ func (w *NMWrapper) lowerMaxNetPriorities(skip string) {
 				delete(settings["ipv6"], "addresses")
 				delete(settings["ipv6"], "routes")
 
+				w.logger.Debugf("Lowering priority of %s to 998", ssid)
+
 				if err := nw.conn.Update(settings); err != nil {
 					nw.conn = nil
 					w.logger.Warnf("error (%s) encountered when updating settings for %s", err, nw.ssid)
 				}
 			}
-			nw.priority = 998
+			nw.priority = getPriorityFromSettings(settings)
 		}
 	}
 }
@@ -473,7 +516,7 @@ func (w *NMWrapper) checkConfigured() {
 // tryCandidates returns true if a network activated.
 func (w *NMWrapper) tryCandidates(ctx context.Context) bool {
 	for _, ssid := range w.getCandidates() {
-		err := w.activateConnection(ctx, ssid)
+		err := w.ActivateConnection(ctx, ssid)
 		if err != nil {
 			w.logger.Error(err)
 			continue
@@ -508,15 +551,18 @@ func (w *NMWrapper) getCandidates() []string {
 		// firstSeen is reset if a network disappears for more than a minute, so retry if it comes back (or generally after 10 minutes)
 		recentlyTried := nw.lastTried.After(nw.firstSeen) && nw.lastTried.After(time.Now().Add(time.Duration(w.cfg.FallbackTimeout)*-1))
 
-		// must be either roaming mode OR priority 999 (in single mode)
-		if !nw.isHotspot && visible && configured && !recentlyTried && (w.cfg.RoamingMode || nw.priority == 999) {
+		if !nw.isHotspot && visible && configured && !recentlyTried {
 			candidates = append(candidates, nw.ssid)
 		}
 	}
 
-	// this shouldn't happen without external network manipulation, but it's non-fatal, so just warn
-	if !w.cfg.RoamingMode && len(candidates) > 1 {
-		w.logger.Warnf("Multiple networks have highest (999) priority. Selection will be arbitrary.")
+	if !w.cfg.RoamingMode {
+		for _, ssid := range candidates {
+			if ssid == w.primarySSID {
+				return []string{ssid}
+			}
+		}
+		return []string{}
 	}
 
 	return candidates
@@ -538,10 +584,10 @@ func (w *NMWrapper) startStateMonitors(ctx context.Context) {
 			}
 
 			w.checkConfigured()
-			if err := w.networkScan(ctx); err != nil {
+			if err := w.NetworkScan(ctx); err != nil {
 				w.logger.Error(err)
 			}
-			if err := w.checkConnection(); err != nil {
+			if err := w.CheckConnection(); err != nil {
 				w.logger.Error(err)
 			}
 			if err := w.checkOnline(false); err != nil {
