@@ -84,6 +84,16 @@ func NewNMWrapper(
 		return nil, err
 	}
 
+	// Is there a configured wifi network? If so, set last times to now so we use normal timeouts.
+	// Otherwise, hotspot will start immediately if not connected, while wifi network might still be booting.
+	for _, nw := range w.networks {
+		if nw.conn != nil && nw.netType == NetworkTypeWifi {
+			w.state.lastConnected = time.Now()
+			w.state.lastOnline = time.Now()
+			break
+		}
+	}
+
 	return w, nil
 }
 
@@ -106,6 +116,10 @@ func (w *NMWrapper) warnIfMultiplePrimaryNetworks() {
 	var primaryCandidates []string
 	highestPriority := int32(-999)
 	for _, nw := range w.networks {
+		if nw.conn == nil || nw.isHotspot {
+			continue
+		}
+
 		if nw.priority > highestPriority {
 			highestPriority = nw.priority
 			primaryCandidates = []string{nw.ssid}

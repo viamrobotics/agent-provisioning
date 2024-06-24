@@ -189,14 +189,12 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 		nw.conn = conn
 		nw.priority = getPriorityFromSettings(settings)
 
-		if nw.priority > highestPriority {
-			highestPriority = nw.priority
-			w.primarySSID = nw.ssid
-		}
-
 		if nw.ssid == w.hotspotSSID {
 			nw.netType = NetworkTypeHotspot
 			nw.isHotspot = true
+		} else if nw.priority > highestPriority {
+			highestPriority = nw.priority
+			w.primarySSID = nw.ssid
 		}
 	}
 
