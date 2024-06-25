@@ -2,144 +2,25 @@
 package networkmanager
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
-	"fmt"
-	"io/fs"
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	gnm "github.com/Otterverse/gonetworkmanager/v2"
-	"github.com/google/uuid"
 	errw "github.com/pkg/errors"
 	"go.uber.org/zap"
 
 	provisioning "github.com/viamrobotics/agent-provisioning"
-	"github.com/viamrobotics/agent-provisioning/portal"
 )
-
-const (
-	DNSMasqFilepath          = "/etc/NetworkManager/dnsmasq-shared.d/80-viam.conf"
-	DNSMasqContentsRedirect  = "address=/#/10.42.0.1\n"
-	DNSMasqContentsSetupOnly = "address=/.setup/10.42.0.1\n"
-
-	ConnCheckFilepath = "/etc/NetworkManager/conf.d/80-viam.conf"
-	ConnCheckContents = "[connectivity]\nuri=http://packages.viam.com/check_network_status.txt\ninterval=300\n"
-)
-
-var (
-	BindAddr = "10.42.0.1"
-	// older networkmanager requires unit32 arrays for IP addresses.
-	IPAsUint32                 = binary.LittleEndian.Uint32([]byte{10, 42, 0, 1})
-	ErrBadPassword             = errors.New("bad or missing password")
-	ErrConnCheckDisabled       = errors.New("NetworkManager connectivity checking disabled by user, network management will be unavailable")
-	ErrNoActiveConnectionFound = errors.New("no active connection found")
-	loopDelay                  = time.Second * 15
-	connectTimeout             = time.Second * 50 // longer than the 45 second timeout in NetworkManager
-)
-
-type NMWrapper struct {
-	monitorWorkers sync.WaitGroup
-	pModeWorkers   sync.WaitGroup
-
-	// blocks start/stop/etc operations
-	opMu sync.Mutex
-
-	// only set during NewNMWrapper, no lock
-	nm       gnm.NetworkManager
-	dev      gnm.DeviceWireless
-	settings gnm.Settings
-	cp       *portal.CaptivePortal
-	hostname string
-	logger   *zap.SugaredLogger
-	pCfg     provisioning.ProvisioningConfig
-	cfgPath  string
-
-	// internal locking
-	state *connectionState
-
-	// locking for data updates
-	dataMu      sync.Mutex
-	networks    map[string]*network
-	hotspotSSID string
-	activeSSID  string
-	lastSSID    string
-}
-
-func (w *NMWrapper) getVisibleNetworks() []provisioning.NetworkInfo {
-	w.dataMu.Lock()
-	defer w.dataMu.Unlock()
-
-	var visible []provisioning.NetworkInfo
-	for _, nw := range w.networks {
-		if nw.lastSeen.After(time.Now().Add(time.Minute*-1)) && !nw.isHotspot {
-			visible = append(visible, getNetworkInfo(nw))
-		}
-	}
-
-	// sort by strongest signal
-	sort.SliceStable(visible, func(i, j int) bool {
-		return visible[i].Signal > visible[j].Signal
-	})
-
-	return visible
-}
-
-func (w *NMWrapper) getLastNetworkTried() provisioning.NetworkInfo {
-	w.dataMu.Lock()
-	defer w.dataMu.Unlock()
-	nw, ok := w.networks[w.lastSSID]
-	if !ok {
-		nw = &network{}
-	}
-	return getNetworkInfo(nw)
-}
-
-type network struct {
-	netType   string
-	ssid      string
-	security  string
-	signal    uint8
-	isHotspot bool
-
-	firstSeen time.Time
-	lastSeen  time.Time
-
-	lastTried     time.Time
-	connected     bool
-	lastConnected time.Time
-	lastError     error
-
-	conn       gnm.Connection
-	activeConn gnm.ActiveConnection
-}
-
-func getNetworkInfo(n *network) provisioning.NetworkInfo {
-	var errStr string
-	if n.lastError != nil {
-		errStr = n.lastError.Error()
-	}
-
-	return provisioning.NetworkInfo{
-		Type:      n.netType,
-		SSID:      n.ssid,
-		Security:  n.security,
-		Signal:    int32(n.signal),
-		Connected: n.connected,
-		LastError: errStr,
-	}
-}
 
 func NewNMWrapper(
 	ctx context.Context,
 	logger *zap.SugaredLogger,
-	pCfg *provisioning.ProvisioningConfig,
-	cfgPath string,
+	cfg *provisioning.Config,
+	viamCfgPath string,
 ) (*NMWrapper, error) {
 	nm, err := gnm.NewNetworkManager()
 	if err != nil {
@@ -151,14 +32,17 @@ func NewNMWrapper(
 		return nil, err
 	}
 
+	logger.Debugf("Config: %+v", cfg)
+
 	w := &NMWrapper{
-		pCfg:     *pCfg,
-		cfgPath:  cfgPath,
-		logger:   logger,
-		nm:       nm,
-		settings: settings,
-		networks: make(map[string]*network),
-		state:    &connectionState{},
+		cfg:         *cfg,
+		viamCfgPath: viamCfgPath,
+		logger:      logger,
+		nm:          nm,
+		settings:    settings,
+		networks:    make(map[string]*network),
+		state:       &connectionState{logger: logger},
+		input:       &provisioning.UserInput{},
 	}
 
 	w.hostname, err = settings.GetPropertyHostname()
@@ -166,7 +50,7 @@ func NewNMWrapper(
 		return nil, errw.Wrap(err, "error getting hostname from NetworkManager, is NetworkManager installed and enabled?")
 	}
 
-	w.hotspotSSID = w.pCfg.HotspotPrefix + "-" + strings.ToLower(w.hostname)
+	w.hotspotSSID = w.cfg.HotspotPrefix + "-" + strings.ToLower(w.hostname)
 	if len(w.hotspotSSID) > 32 {
 		w.hotspotSSID = w.hotspotSSID[:32]
 	}
@@ -183,216 +67,97 @@ func NewNMWrapper(
 		return nil, err
 	}
 
-	if err = w.networkScan(ctx); err != nil {
+	w.checkConfigured()
+	if err := w.NetworkScan(ctx); err != nil {
 		return nil, err
+	}
+
+	w.warnIfMultiplePrimaryNetworks()
+
+	if w.cfg.RoamingMode {
+		w.logger.Info("Roaming Mode enabled. Will try all connections for global internet connectivity.")
+	} else {
+		w.logger.Infof("Default (Single Network) Mode enabled. Will directly connect only to primary network: %s", w.primarySSID)
+	}
+
+	if err := w.CheckConnection(); err != nil {
+		return nil, err
+	}
+
+	// Is there a configured wifi network? If so, set last times to now so we use normal timeouts.
+	// Otherwise, hotspot will start immediately if not connected, while wifi network might still be booting.
+	for _, nw := range w.networks {
+		if nw.conn != nil && nw.netType == NetworkTypeWifi {
+			w.state.lastConnected = time.Now()
+			w.state.lastOnline = time.Now()
+			break
+		}
 	}
 
 	return w, nil
 }
 
-func (w *NMWrapper) testConnCheck() error {
-	connCheckEnabled, err := w.nm.GetPropertyConnectivityCheckEnabled()
-	if err != nil {
-		return errw.Wrap(err, "error getting NetworkManager connectivity check state")
-	}
-
-	if !connCheckEnabled {
-		hasConnCheck, err := w.nm.GetPropertyConnectivityCheckAvailable()
+func (w *NMWrapper) Close() {
+	if w.state.getProvisioning() {
+		err := w.StopProvisioning()
 		if err != nil {
-			return errw.Wrap(err, "error getting NetworkManager connectivity check configuration")
-		}
-
-		if !hasConnCheck {
-			if err := w.writeConnCheck(); err != nil {
-				return (errw.Wrap(err, "error writing NetworkManager connectivity check configuration"))
-			}
-			if err := w.nm.Reload(0); err != nil {
-				return (errw.Wrap(err, "error reloading NetworkManager"))
-			}
-
-			hasConnCheck, err = w.nm.GetPropertyConnectivityCheckAvailable()
-			if err != nil {
-				return errw.Wrap(err, "error getting NetworkManager connectivity check configuration")
-			}
-			if !hasConnCheck {
-				return errors.New("error configuring NetworkManager connectivity check")
-			}
-		}
-
-		connCheckEnabled, err = w.nm.GetPropertyConnectivityCheckEnabled()
-		if err != nil {
-			return errw.Wrap(err, "error getting NetworkManager connectivity check state")
-		}
-
-		if !connCheckEnabled {
-			return ErrConnCheckDisabled
+			w.logger.Error(err)
 		}
 	}
-	return nil
+	w.monitorWorkers.Wait()
 }
 
-func (w *NMWrapper) initWifiDev() error {
-	devices, err := w.nm.GetDevices()
-	if err != nil {
-		return err
+func (w *NMWrapper) warnIfMultiplePrimaryNetworks() {
+	if w.cfg.RoamingMode {
+		return
 	}
-
-	for _, device := range devices {
-		devType, err := device.GetPropertyDeviceType()
-		if err != nil {
-			return err
-		}
-		if devType == gnm.NmDeviceTypeWifi {
-			wifiDev, ok := device.(gnm.DeviceWireless)
-			if ok {
-				w.dev = wifiDev
-				return w.dev.SetPropertyAutoConnect(true)
-			}
-		}
-	}
-	return fmt.Errorf("cannot find wifi device")
-}
-
-func (w *NMWrapper) networkScan(ctx context.Context) error {
-	prevScan, err := w.dev.GetPropertyLastScan()
-	if err != nil {
-		return errw.Wrap(err, "error scanning wifi")
-	}
-
-	err = w.dev.RequestScan()
-	if err != nil {
-		return errw.Wrap(err, "error scanning wifi")
-	}
-
-	var lastScan int64
-	for {
-		lastScan, err = w.dev.GetPropertyLastScan()
-		if err != nil {
-			return errw.Wrap(err, "error scanning wifi")
-		}
-		if lastScan > prevScan {
-			break
-		}
-		if !provisioning.HealthySleep(ctx, time.Second) {
-			return nil
-		}
-	}
-
-	wifiList, err := w.dev.GetAccessPoints()
-	if err != nil {
-		return errw.Wrap(err, "error scanning wifi")
-	}
-
 	w.dataMu.Lock()
 	defer w.dataMu.Unlock()
-
-	// set "now" to be reusable for consistency
-	now := time.Now()
-	for _, ap := range wifiList {
-		//nolint:nilerr
-		if ctx.Err() != nil {
-			return nil
-		}
-		ssid, err := ap.GetPropertySSID()
-		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
-			continue
-		}
-
-		signal, err := ap.GetPropertyStrength()
-		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
-			continue
-		}
-
-		apFlags, err := ap.GetPropertyFlags()
-		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
-			continue
-		}
-
-		wpaFlags, err := ap.GetPropertyWPAFlags()
-		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
-			continue
-		}
-
-		rsnFlags, err := ap.GetPropertyRSNFlags()
-		if err != nil {
-			w.logger.Error(errw.Wrap(err, "error scanning wifi"))
-			continue
-		}
-
-		nw, ok := w.networks[ssid]
-		if !ok {
-			nw = &network{}
-			w.networks[ssid] = nw
-		}
-
-		nw.netType = "wifi"
-		nw.ssid = ssid
-		nw.security = parseWPAFlags(apFlags, wpaFlags, rsnFlags)
-		nw.signal = signal
-		nw.lastSeen = now
-
-		if nw.firstSeen.IsZero() {
-			nw.firstSeen = now
-		}
-	}
-
+	var primaryCandidates []string
+	highestPriority := int32(-999)
 	for _, nw := range w.networks {
-		//nolint:nilerr
-		if ctx.Err() != nil {
-			return nil
+		if nw.conn == nil || nw.isHotspot {
+			continue
 		}
 
-		// if a network isn't visible, reset the firstSeen time
-		if nw.lastSeen.Before(time.Now().Add(time.Minute * -1)) {
-			nw.firstSeen = time.Time{}
+		if nw.priority > highestPriority {
+			highestPriority = nw.priority
+			primaryCandidates = []string{nw.ssid}
+		} else if nw.priority == highestPriority {
+			primaryCandidates = append(primaryCandidates, nw.ssid)
 		}
 	}
-
-	return w.updateKnownConnections(ctx)
+	if len(primaryCandidates) > 1 {
+		w.logger.Warnf(
+			"Multiple networks %s tied for highest priority (%d), selection will be arbitrary. Consider using Roaming Mode.",
+			primaryCandidates,
+			highestPriority,
+		)
+	}
 }
 
-// updates connections/settings from those known to NetworkManager.
-func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
-	conns, err := w.settings.ListConnections()
-	if err != nil {
-		return err
-	}
-
-	for _, conn := range conns {
-		//nolint:nilerr
-		if ctx.Err() != nil {
-			return nil
-		}
-		settings, err := conn.GetSettings()
-		if err != nil {
-			return err
-		}
-
-		ssid := getSSIDFromSettings(settings)
-
-		if ssid == "" {
-			// wired ethernet or some other type of connection
-			continue
-		}
-
-		// actually record the network
-		nw, ok := w.networks[ssid]
-		if !ok {
-			nw = &network{}
-			w.networks[ssid] = nw
-		}
-		nw.conn = conn
-
-		if ssid == w.hotspotSSID {
-			nw.isHotspot = true
+func (w *NMWrapper) getVisibleNetworks() []provisioning.NetworkInfo {
+	var visible []provisioning.NetworkInfo
+	for _, nw := range w.networks {
+		if nw.lastSeen.After(time.Now().Add(time.Minute*-1)) && !nw.isHotspot {
+			visible = append(visible, nw.getInfo())
 		}
 	}
 
-	return nil
+	// sort by strongest signal
+	sort.SliceStable(visible, func(i, j int) bool {
+		return visible[i].Signal > visible[j].Signal
+	})
+
+	return visible
+}
+
+func (w *NMWrapper) getLastNetworkTried() provisioning.NetworkInfo {
+	nw, ok := w.networks[w.lastSSID]
+	if !ok {
+		nw = &network{}
+	}
+	return nw.getInfo()
 }
 
 func (w *NMWrapper) checkOnline(force bool) error {
@@ -426,89 +191,77 @@ func (w *NMWrapper) checkOnline(force bool) error {
 	return err
 }
 
-func getSSIDFromSettings(settings gnm.ConnectionSettings) string {
-	// gnm.ConnectionSettings is a map[string]map[string]interface{}
-	wifi, ok := settings["802-11-wireless"]
+func (w *NMWrapper) CheckConnection() error {
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	var connected bool
+	defer func() {
+		if connected && w.activeSSID != "" {
+			w.logger.Debugf("Connected to: %s", w.activeSSID)
+		}
+		w.state.setConnected(connected)
+	}()
+
+	activeConnection, err := w.dev.GetPropertyActiveConnection()
+	if err != nil {
+		return err
+	}
+
+	if activeConnection == nil {
+		return nil
+	}
+
+	connection, err := activeConnection.GetPropertyConnection()
+	if err != nil {
+		return err
+	}
+
+	settings, err := connection.GetSettings()
+	if err != nil {
+		return err
+	}
+
+	ssid := getSSIDFromSettings(settings)
+
+	w.dataMu.Lock()
+	defer w.dataMu.Unlock()
+
+	w.activeSSID = ssid
+	activeNetwork, ok := w.networks[w.activeSSID]
 	if !ok {
-		return ""
+		err := errw.Errorf("active network not found in network list: %s", w.activeSSID)
+		w.activeSSID = ""
+		return err
 	}
 
-	modeRaw, ok := wifi["mode"]
-	if !ok {
-		return ""
+	activeNetwork.activeConn = activeConnection
+
+	state, err := activeNetwork.activeConn.GetPropertyState()
+	if err != nil {
+		err = errw.Wrapf(err, "getting state of active connection: %s", w.activeSSID)
+		// active connection will be removed from dbus once its no longer active, so we nil it out
+		activeNetwork.activeConn = nil
+		activeNetwork.connected = false
+		w.activeSSID = ""
+		return err
+	}
+	// in roaming mode, we don't care WHAT network is connected
+	if w.cfg.RoamingMode && state == gnm.NmActiveConnectionStateActivated && w.activeSSID != w.hotspotSSID {
+		connected = true
+		return nil
 	}
 
-	mode, ok := modeRaw.(string)
-	// we'll take hotspots and "normal" infrastructure connections only
-	if !ok || !(mode == "infrastructure" || mode == "ap") {
-		return ""
+	// in normal (single) mode, we need to be connected to the primary (highest priority) network
+	if state == gnm.NmActiveConnectionStateActivated && w.activeSSID == w.primarySSID {
+		connected = true
 	}
 
-	ssidRaw, ok := wifi["ssid"]
-	if !ok {
-		return ""
-	}
-	ssidBytes, ok := ssidRaw.([]byte)
-	if !ok {
-		return ""
-	}
-	if len(ssidBytes) == 0 {
-		return ""
-	}
-	return string(ssidBytes)
-}
-
-func getSettingsWifi(id, ssid, psk string, priority int) gnm.ConnectionSettings {
-	settings := gnm.ConnectionSettings{
-		"connection": map[string]interface{}{
-			"id":                   id,
-			"uuid":                 uuid.New().String(),
-			"type":                 "802-11-wireless",
-			"autoconnect":          true,
-			"autoconnect-priority": priority,
-		},
-		"802-11-wireless": map[string]interface{}{
-			"mode": "infrastructure",
-			"ssid": []byte(ssid),
-		},
-	}
-	if psk != "" {
-		settings["802-11-wireless-security"] = map[string]interface{}{"key-mgmt": "wpa-psk", "psk": psk}
-	}
-	return settings
-}
-
-func getSettingsHotspot(id, ssid, psk string) gnm.ConnectionSettings {
-	settings := gnm.ConnectionSettings{
-		"connection": map[string]interface{}{
-			"id":          id,
-			"uuid":        uuid.New().String(),
-			"type":        "802-11-wireless",
-			"autoconnect": false,
-		},
-		"802-11-wireless": map[string]interface{}{
-			"mode": "ap",
-			"ssid": []byte(ssid),
-		},
-		"802-11-wireless-security": map[string]interface{}{
-			"key-mgmt": "wpa-psk",
-			"psk":      psk,
-		},
-		"ipv4": map[string]interface{}{
-			"method":    "shared",
-			"addresses": [][]uint32{{IPAsUint32, 24, IPAsUint32}},
-		},
-		"ipv6": map[string]interface{}{
-			"method": "disabled",
-		},
-	}
-	return settings
+	return nil
 }
 
 // StartProvisioning puts the wifi in hotspot mode and starts a captive portal.
-func (w *NMWrapper) StartProvisioning(ctx context.Context, userInputChan chan struct{}) error {
-	provisioningMode, _ := w.state.getProvisioning()
-	if provisioningMode {
+func (w *NMWrapper) StartProvisioning(ctx context.Context) error {
+	if w.state.getProvisioning() {
 		return errors.New("provisioning mode already started")
 	}
 
@@ -516,7 +269,7 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, userInputChan chan st
 	defer w.opMu.Unlock()
 
 	w.logger.Info("Starting provisioning mode.")
-	if err := w.addOrUpdateConnection(provisioning.NetworkConfig{Type: "hotspot", SSID: w.hotspotSSID}); err != nil {
+	if _, err := w.addOrUpdateConnection(provisioning.NetworkConfig{Type: NetworkTypeHotspot, SSID: w.hotspotSSID}); err != nil {
 		return err
 	}
 	if err := w.activateConnection(ctx, w.hotspotSSID); err != nil {
@@ -524,74 +277,10 @@ func (w *NMWrapper) StartProvisioning(ctx context.Context, userInputChan chan st
 	}
 
 	// start portal with ssid list and known connections
-	cp := portal.NewPortal(w.logger, BindAddr, w.pCfg)
-	w.dataMu.Lock()
-	w.cp = cp
-	w.dataMu.Unlock()
-	if err := w.cp.Run(); err != nil {
+	if err := w.startPortal(); err != nil {
 		err = errors.Join(err, w.deactivateConnection(w.hotspotSSID))
-		w.dataMu.Lock()
-		w.cp = nil
-		w.dataMu.Unlock()
 		return errw.Wrap(err, "could not start web/grpc portal")
 	}
-
-	w.pModeWorkers.Add(1)
-	go func() {
-		defer w.pModeWorkers.Done()
-
-		w.logger.Debug("provisioning background loop started")
-		defer w.logger.Debug("provisioning background loop stopped")
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-
-			run, _ := w.state.getProvisioning()
-			if !run {
-				return
-			}
-
-			settings := cp.GetUserInput()
-			if settings == nil {
-				online, _ := w.state.getOnline()
-				cp.SetData(online, w.state.getConfigured(), w.getVisibleNetworks(), w.getLastNetworkTried())
-				continue
-			}
-
-			if settings.RawConfig != "" || settings.PartID != "" {
-				w.logger.Debug("device config received")
-				err := provisioning.WriteDeviceConfig(w.cfgPath, settings)
-				if err != nil {
-					cp.AppendErrors(err)
-					w.logger.Error(err)
-				}
-			}
-
-			if settings.SSID != "" {
-				w.logger.Debugf("wifi settings received for %s", settings.SSID)
-				cfg := provisioning.NetworkConfig{
-					Type:     "wifi",
-					SSID:     settings.SSID,
-					PSK:      settings.PSK,
-					Priority: 100,
-				}
-
-				err := w.AddOrUpdateConnection(cfg)
-				if err != nil {
-					cp.AppendErrors(err)
-					w.logger.Error(err)
-					continue
-				}
-			}
-
-			// signal that the user sent stuff so we can break the main loop
-			userInputChan <- struct{}{}
-		}
-	}()
 
 	w.state.setProvisioning(true)
 	return nil
@@ -602,16 +291,8 @@ func (w *NMWrapper) StopProvisioning() error {
 	defer w.opMu.Unlock()
 	w.logger.Info("Stopping provisioning mode.")
 	w.state.setProvisioning(false)
-	w.pModeWorkers.Wait()
-	var err error
-
-	w.dataMu.Lock()
-	if w.cp != nil {
-		err = w.cp.Stop()
-	}
-	w.cp = nil
-	w.dataMu.Unlock()
-
+	err := w.stopPortal()
+	w.provisioningWorkers.Wait()
 	err2 := w.deactivateConnection(w.hotspotSSID)
 	if errors.Is(err2, ErrNoActiveConnectionFound) {
 		return err
@@ -619,21 +300,8 @@ func (w *NMWrapper) StopProvisioning() error {
 	return errors.Join(err, err2)
 }
 
-func (w *NMWrapper) Close() {
-	provisioningMode, _ := w.state.getProvisioning()
-
-	if provisioningMode {
-		err := w.StopProvisioning()
-		if err != nil {
-			w.logger.Error(err)
-		}
-	}
-	w.monitorWorkers.Wait()
-}
-
 func (w *NMWrapper) ActivateConnection(ctx context.Context, ssid string) error {
-	provisioning, _ := w.state.getProvisioning()
-	if provisioning {
+	if w.state.getProvisioning() {
 		return errors.New("cannot activate another connection while in provisioning mode")
 	}
 
@@ -676,7 +344,10 @@ func (w *NMWrapper) activateConnection(ctx context.Context, ssid string) error {
 	nw.lastError = nil
 	w.activeSSID = ssid
 
+	w.logger.Infof("Successfully activated connection for SSID: %s", ssid)
+
 	if ssid != w.hotspotSSID {
+		w.state.setConnected(true)
 		return w.checkOnline(true)
 	}
 
@@ -700,6 +371,9 @@ func (w *NMWrapper) deactivateConnection(ssid string) error {
 		return errw.Wrapf(err, "error deactivating connection for ssid: %s", ssid)
 	}
 
+	w.logger.Infof("Successfully deactivated connection for SSID: %s", ssid)
+
+	w.state.setConnected(false)
 	nw.connected = false
 	nw.lastConnected = time.Now()
 	nw.activeConn = nil
@@ -736,26 +410,30 @@ func (w *NMWrapper) waitForConnect(ctx context.Context) error {
 				return errw.Errorf("connection failed: %s", update.Reason)
 			default:
 			}
-
-		case <-timeoutCtx.Done():
-			return errw.Wrap(ctx.Err(), "waiting for network activation")
+		default:
+			if !provisioning.HealthySleep(timeoutCtx, time.Second) {
+				return errw.Wrap(ctx.Err(), "waiting for network activation")
+			}
 		}
 	}
 }
 
-func (w *NMWrapper) AddOrUpdateConnection(cfg provisioning.NetworkConfig) error {
+func (w *NMWrapper) AddOrUpdateConnection(cfg provisioning.NetworkConfig) (bool, error) {
 	w.opMu.Lock()
 	defer w.opMu.Unlock()
 	return w.addOrUpdateConnection(cfg)
 }
 
-func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error {
-	if cfg.Type != "wifi" && cfg.Type != "hotspot" {
-		return errw.Errorf("unspported network type %s, only 'wifi' currently supported", cfg.Type)
+// returns true if network was new (added) and not updated.
+func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) (bool, error) {
+	var newNetwork bool
+
+	if cfg.Type != NetworkTypeWifi && cfg.Type != NetworkTypeHotspot {
+		return newNetwork, errw.Errorf("unspported network type %s, only %s currently supported", cfg.Type, NetworkTypeWifi)
 	}
 
 	if cfg.PSK != "" && len(cfg.PSK) < 8 {
-		return errors.New("wifi passwords must be at least 8 characters long, or completely empty (for unsecured networks)")
+		return newNetwork, errors.New("wifi passwords must be at least 8 characters long, or completely empty (for unsecured networks)")
 	}
 
 	w.dataMu.Lock()
@@ -763,19 +441,29 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 
 	nw, ok := w.networks[cfg.SSID]
 	if !ok {
-		nw = &network{}
+		nw = &network{
+			ssid:    cfg.SSID,
+			netType: cfg.Type,
+		}
 		w.networks[cfg.SSID] = nw
 	}
 
 	nw.lastTried = time.Time{}
+	nw.priority = cfg.Priority
 
-	settings := getSettingsWifi(w.pCfg.Manufacturer+"-"+cfg.SSID, cfg.SSID, cfg.PSK, cfg.Priority)
-	if cfg.Type == "hotspot" {
+	settings := generateWifiSettings(w.cfg.Manufacturer+"-"+cfg.SSID, cfg.SSID, cfg.PSK, cfg.Priority)
+	if cfg.Type == NetworkTypeHotspot {
 		if cfg.SSID != w.hotspotSSID {
-			return errors.New("only the builtin provisioning hotspot may use the 'hotspot' network type")
+			return newNetwork, errw.Errorf("only the builtin provisioning hotspot may use the %s network type", NetworkTypeHotspot)
 		}
 		nw.isHotspot = true
-		settings = getSettingsHotspot(w.pCfg.HotspotPrefix, w.hotspotSSID, w.pCfg.HotspotPassword)
+		settings = generateHotspotSettings(w.cfg.HotspotPrefix, w.hotspotSSID, w.cfg.HotspotPassword)
+	}
+
+	if !w.cfg.RoamingMode && cfg.Priority == 999 {
+		// lower the priority of any existing/prior primary network
+		w.lowerMaxNetPriorities(cfg.SSID)
+		w.primarySSID = cfg.SSID
 	}
 
 	w.logger.Infof("Adding/updating settings for SSID %s", cfg.SSID)
@@ -789,89 +477,76 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) error 
 	}
 
 	if nw.conn == nil {
+		newNetwork = true
 		newConn, err := w.settings.AddConnection(settings)
 		if err != nil {
-			return errw.Wrap(err, "error adding new connection")
+			return newNetwork, errw.Wrap(err, "error adding new connection")
 		}
 		nw.conn = newConn
-		return nil
+		return newNetwork, nil
 	}
-	return nil
+	return newNetwork, nil
 }
 
-func (w *NMWrapper) writeDNSMasq() error {
-	DNSMasqContents := DNSMasqContentsRedirect
-	if w.pCfg.DisableDNSRedirect {
-		DNSMasqContents = DNSMasqContentsSetupOnly
-	}
+// this doesn't error as it's not technically fatal if it fails.
+func (w *NMWrapper) lowerMaxNetPriorities(skip string) {
+	for ssid, nw := range w.networks {
+		if ssid == skip || ssid == w.hotspotSSID || nw.priority < 999 {
+			continue
+		}
 
-	fileBytes, err := os.ReadFile(DNSMasqFilepath)
-	if err == nil && bytes.Equal(fileBytes, []byte(DNSMasqContents)) {
-		return nil
-	}
+		if nw.conn != nil {
+			settings, err := nw.conn.GetSettings()
+			if err != nil {
+				nw.conn = nil
+				w.logger.Warnf("error (%s) encountered when getting settings for %s", err, nw.ssid)
+				continue
+			}
 
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	//nolint:gosec
-	return os.WriteFile(DNSMasqFilepath, []byte(DNSMasqContents), 0o644)
-}
+			if getPriorityFromSettings(settings) == 999 {
+				settings["connection"]["autoconnect-priority"] = 998
 
-func (w *NMWrapper) writeConnCheck() error {
-	fileBytes, err := os.ReadFile(ConnCheckFilepath)
-	if err == nil && bytes.Equal(fileBytes, []byte(ConnCheckContents)) {
-		return nil
-	}
+				// deprecated fields that are read-only, so can't try to set them
+				delete(settings["ipv6"], "addresses")
+				delete(settings["ipv6"], "routes")
 
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	//nolint:gosec
-	return os.WriteFile(ConnCheckFilepath, []byte(ConnCheckContents), 0o644)
-}
+				w.logger.Debugf("Lowering priority of %s to 998", ssid)
 
-func parseWPAFlags(apFlags, wpaFlags, rsnFlags uint32) string {
-	flags := []string{}
-	if apFlags&uint32(gnm.Nm80211APFlagsPrivacy) != 0 && wpaFlags == uint32(gnm.Nm80211APSecNone) && rsnFlags == uint32(gnm.Nm80211APSecNone) {
-		return "WEP"
+				if err := nw.conn.Update(settings); err != nil {
+					nw.conn = nil
+					w.logger.Warnf("error (%s) encountered when updating settings for %s", err, nw.ssid)
+				}
+			}
+			nw.priority = getPriorityFromSettings(settings)
+		}
 	}
-
-	if wpaFlags == uint32(gnm.Nm80211APSecNone) && rsnFlags == uint32(gnm.Nm80211APSecNone) {
-		return "-"
-	}
-
-	if wpaFlags != uint32(gnm.Nm80211APSecNone) {
-		flags = append(flags, "WPA1")
-	}
-	if rsnFlags&uint32(gnm.Nm80211APSecKeyMgmtPSK) != 0 || rsnFlags&uint32(gnm.Nm80211APSecKeyMgmt8021X) != 0 {
-		flags = append(flags, "WPA2")
-	}
-	if rsnFlags&uint32(gnm.Nm80211APSecKeyMgmtSAE) != 0 {
-		flags = append(flags, "WPA3")
-	}
-	if rsnFlags&uint32(gnm.Nm80211APSecKeyMgmtOWE) != 0 {
-		flags = append(flags, "OWE")
-	} else if rsnFlags&uint32(gnm.Nm80211APSecKeyMgmtOWETM) != 0 {
-		flags = append(flags, "OWE-TM")
-	}
-	if wpaFlags&uint32(gnm.Nm80211APSecKeyMgmt8021X) != 0 || rsnFlags&uint32(gnm.Nm80211APSecKeyMgmt8021X) != 0 {
-		flags = append(flags, "802.1X")
-	}
-
-	return strings.Join(flags, " ")
 }
 
 func (w *NMWrapper) checkConfigured() {
-	_, err := os.ReadFile(w.cfgPath)
+	_, err := os.ReadFile(w.viamCfgPath)
 	w.state.setConfigured(err == nil)
 }
 
 // tryCandidates returns true if a network activated.
 func (w *NMWrapper) tryCandidates(ctx context.Context) bool {
 	for _, ssid := range w.getCandidates() {
-		if err := w.activateConnection(ctx, ssid); err == nil {
+		err := w.ActivateConnection(ctx, ssid)
+		if err != nil {
+			w.logger.Error(err)
+			continue
+		}
+
+		// in single mode we just need a connection
+		if !w.cfg.RoamingMode {
 			return true
 		}
+
+		// in roaming mode we need full internet
+		if w.state.getOnline() {
+			return true
+		}
+
+		w.logger.Warnf("SSID %s connected, but does not provide internet access.", ssid)
 	}
 	return false
 }
@@ -887,40 +562,49 @@ func (w *NMWrapper) getCandidates() []string {
 		// ssid has a connection known to network manager
 		configured := nw.conn != nil
 
-		// firstSeen is reset if a network disappears for more than a minute, so retry if it comes back
-		recentlyTried := nw.lastTried.After(nw.firstSeen)
+		// firstSeen is reset if a network disappears for more than a minute, so retry if it comes back (or generally after 10 minutes)
+		recentlyTried := nw.lastTried.After(nw.firstSeen) && nw.lastTried.After(time.Now().Add(time.Duration(w.cfg.FallbackTimeout)*-1))
 
 		if !nw.isHotspot && visible && configured && !recentlyTried {
 			candidates = append(candidates, nw.ssid)
 		}
 	}
+
+	if !w.cfg.RoamingMode {
+		for _, ssid := range candidates {
+			if ssid == w.primarySSID {
+				return []string{ssid}
+			}
+		}
+		return []string{}
+	}
+
 	return candidates
 }
 
 func (w *NMWrapper) startStateMonitors(ctx context.Context) {
-	w.checkConfigured()
 	if err := w.checkOnline(true); err != nil {
-		w.logger.Error(err)
-	}
-	if err := w.networkScan(ctx); err != nil {
 		w.logger.Error(err)
 	}
 
 	w.monitorWorkers.Add(1)
 	go func() {
 		defer w.monitorWorkers.Done()
-		w.logger.Debug("background state monitors started")
-		defer w.logger.Debug("background state monitors stopped")
+		w.logger.Info("Background state monitors started")
+		defer w.logger.Info("Background state monitors stopped")
 		for {
-			if !provisioning.HealthySleep(ctx, loopDelay) {
+			if !provisioning.Sleep(ctx, scanLoopDelay) {
 				return
 			}
 
 			w.checkConfigured()
-			if err := w.checkOnline(false); err != nil {
+			if err := w.NetworkScan(ctx); err != nil {
 				w.logger.Error(err)
 			}
-			if err := w.networkScan(ctx); err != nil {
+			if err := w.CheckConnection(); err != nil {
+				w.logger.Error(err)
+			}
+			if err := w.checkOnline(false); err != nil {
 				w.logger.Error(err)
 			}
 		}
@@ -930,49 +614,137 @@ func (w *NMWrapper) startStateMonitors(ctx context.Context) {
 func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 	w.startStateMonitors(ctx)
 
-	userInputChan := make(chan struct{}, 1)
 	var userInputReceived bool
 
 	for {
-		select {
-		case <-ctx.Done():
+		if !provisioning.HealthySleep(ctx, mainLoopDelay) {
 			return nil
-		case <-userInputChan:
-			userInputReceived = true
+		}
+		userInput := w.GetUserInput()
+		if userInput != nil {
+			if userInput.RawConfig != "" || userInput.PartID != "" {
+				w.logger.Info("Device config received")
+				err := provisioning.WriteDeviceConfig(w.viamCfgPath, *userInput)
+				if err != nil {
+					w.dataMu.Lock()
+					w.errors = append(w.errors, err)
+					w.dataMu.Unlock()
+					w.logger.Error(err)
+					continue
+				}
+				w.checkConfigured()
+				userInputReceived = true
+			}
+
+			var newSSID string
+			var newNetwork bool
+			if userInput.SSID != "" {
+				w.logger.Infof("Wifi settings received for %s", userInput.SSID)
+				priority := int32(999)
+				if w.cfg.RoamingMode {
+					priority = 100
+				}
+				cfg := provisioning.NetworkConfig{
+					Type:     "wifi",
+					SSID:     userInput.SSID,
+					PSK:      userInput.PSK,
+					Priority: priority,
+				}
+				var err error
+				newNetwork, err = w.AddOrUpdateConnection(cfg)
+				if err != nil {
+					w.dataMu.Lock()
+					w.errors = append(w.errors, err)
+					w.dataMu.Unlock()
+					w.logger.Error(err)
+					continue
+				}
+				userInputReceived = true
+				newSSID = cfg.SSID
+			}
+
 			// wait 3 seconds so responses can be sent to/seen by user
 			if !provisioning.HealthySleep(ctx, time.Second*3) {
 				return nil
 			}
-		case <-time.After(loopDelay):
+			if newNetwork {
+				err := w.StopProvisioning()
+				if err != nil {
+					w.logger.Error(err)
+					continue
+				}
+				err = w.ActivateConnection(ctx, newSSID)
+				if err != nil {
+					w.logger.Error(err)
+					continue
+				}
+				if !w.state.getOnline() {
+					err := w.deactivateConnection(newSSID)
+					if err != nil {
+						w.logger.Error(err)
+					}
+					w.dataMu.Lock()
+					nw, ok := w.networks[newSSID]
+					if ok {
+						// add a user warning for the portal
+						err = errw.New("Network has no internet. Resubmit to use anyway.")
+						nw.lastError = err
+						w.logger.Warn(err)
+					} else {
+						w.logger.Error("cannot find ssid %s in network list", newSSID)
+					}
+					w.dataMu.Unlock()
+					err = w.StartProvisioning(ctx)
+					if err != nil {
+						w.logger.Error(err)
+					}
+				}
+			}
 		}
 
-		isOnline, lastOnline := w.state.getOnline()
+		isOnline := w.state.getOnline()
+		lastOnline := w.state.getLastOnline()
+		isConnected := w.state.getConnected()
+		lastConnected := w.state.getLastConnected()
+		hasConnectivity := isConnected || isOnline
+		lastConnectivity := lastConnected
+		if lastOnline.After(lastConnected) {
+			lastConnectivity = lastOnline
+		}
 		isConfigured := w.state.getConfigured()
-		allGood := isOnline && isConfigured
-		pMode, pModeChange := w.state.getProvisioning()
+		allGood := isConfigured && (isConnected || isOnline)
+		if w.cfg.RoamingMode {
+			allGood = isOnline && isConfigured
+			hasConnectivity = isOnline
+			lastConnectivity = lastOnline
+		}
+		pMode := w.state.getProvisioning()
+		pModeChange := w.state.getProvisioningChange()
 		now := time.Now()
 
-		w.logger.Debugf("online: %t, config_present: %t", isOnline, isConfigured)
+		w.logger.Debugf("wifi connected: %t, internet reachable: %t, config present: %t", isConnected, isOnline, isConfigured)
 
 		if pMode {
 			// complex logic, so wasting some variables for readability
 
 			// portal interaction time is updated when a user loads a page or makes a grpc request
-			inactivePortal := w.cp.GetLastInteraction().Before(now.Add(time.Minute*-5)) || userInputReceived
+			inactivePortal := w.state.getLastInteraction().Before(now.Add(time.Duration(w.cfg.UserTimeout)*-1)) || userInputReceived
 
 			// exit/retry to test networks only if there's no recent user interaction AND configuration is present
 			haveCandidates := len(w.getCandidates()) > 0 && inactivePortal && isConfigured
 
-			// exit/retry every ten minutes as a fallback, unless user is active
-			tenMinutes := pModeChange.Before(now.Add(time.Minute*-10)) && inactivePortal
+			// exit/retry every FallbackTimeout (10 minute default), unless user is active
+			fallbackHit := pModeChange.Before(now.Add(time.Duration(w.cfg.FallbackTimeout)*-1)) && inactivePortal
 
-			shouldExit := allGood || haveCandidates || tenMinutes
+			shouldExit := allGood || haveCandidates || fallbackHit
+
+			w.logger.Debugf("inactive portal: %t, have candidates: %t, fallback timeout: %t", inactivePortal, haveCandidates, fallbackHit)
 
 			if shouldExit {
 				if err := w.StopProvisioning(); err != nil {
 					w.logger.Error(err)
 				} else {
-					pMode, _ = w.state.getProvisioning()
+					pMode = w.state.getProvisioning()
 				}
 			}
 		}
@@ -982,20 +754,27 @@ func (w *NMWrapper) StartMonitoring(ctx context.Context) error {
 		}
 
 		// not in provisioning mode
-		if !isOnline {
+		if !hasConnectivity {
 			if w.tryCandidates(ctx) {
-				isOnline, lastOnline = w.state.getOnline()
-				if isOnline {
+				hasConnectivity = w.state.getConnected() || w.state.getOnline()
+				// if we're roaming or this network was JUST added, it must have internet
+				if w.cfg.RoamingMode {
+					hasConnectivity = w.state.getOnline()
+				}
+				if hasConnectivity {
 					continue
+				}
+				lastConnectivity = w.state.getLastConnected()
+				if w.cfg.RoamingMode {
+					lastConnectivity = w.state.getLastOnline()
 				}
 			}
 		}
 
 		// not in provisioning mode, so start it if not configured (/etc/viam.json)
-		// OR as long as we've been offline for at least two minutes
-		twoMinutesAgo := now.Add(time.Minute * -2)
-		if !isConfigured || (lastOnline.Before(twoMinutesAgo)) {
-			if err := w.StartProvisioning(ctx, userInputChan); err != nil {
+		// OR as long as we've been offline for at least OfflineTimeout (2 minute default)
+		if !isConfigured || lastConnectivity.Before(now.Add(time.Duration(w.cfg.OfflineTimeout)*-1)) {
+			if err := w.StartProvisioning(ctx); err != nil {
 				w.logger.Error(err)
 			}
 		}

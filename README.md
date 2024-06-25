@@ -47,8 +47,10 @@ Lastly, if the script cannot detect your mountpoint, you can specify it directly
 Note: On all symlink operations, be sure to use relative symlinks, especially if working on a mounted image (e.g. not a live/booted system.)
 
 
-#### Factory/Manufacturer Configuration
-`/etc/viam-provisioning.json` can be placed on a device image to customize the provisioning experience. 
+## Configuration
+No configuration is typically neccessary for normal use. Provisioning mode will start a hotspot when either not configured (no /etc/viam.json) or not online.
+
+`/etc/viam-provisioning.json` can be placed on a device/image to customize the provisioning (default) experience before a device is first connected. These values can be overridden later via "attributes" in the agent-provisioning subsystem in the device's config. See the Additional Networks section below for an example using config via cloud "attributes."
 
 Example `/etc/viam-provisioning.json`
 ```json
@@ -56,9 +58,13 @@ Example `/etc/viam-provisioning.json`
   "manufacturer": "Skywalker",
   "model": "C-3PO",
   "fragment_id": "2567c87d-7aef-41bc-b82c-d363f9874663",
-  "disable_dns_redirect": true,
   "hotspot_prefix": "skywalker-setup",
-  "hotspot_password": "skywalker123"
+  "disable_dns_redirect": true,
+  "hotspot_password": "skywalker123",
+  "roaming_mode": false,
+  "offline_timeout": "3m30s",
+  "user_timeout": "2m30s",
+  "fallback_timeout": "15m"
 }
 ```
 * All fields are optional (as is the entire file.) Values not set will use defaults.
@@ -68,63 +74,73 @@ Example `/etc/viam-provisioning.json`
   * Purely informative. May be displayed on captive portal and/or mobile app.
 * fragment_id: No default.
   * Corresponds to a fragment_id in the Viam cloud. If present, mobile app can pre-configure a robot for a user by using this.
+* hotspot_prefix: Defaults to `viam-setup`
+  * Will have the hostname of the device append and be used for the provisioning hotspot SSID.
 * disable_dns_redirect: Defaults to false.
   * By default, ALL DNS lookups via the provisioning hotspot will redirect to the device. This causes most phones/mobile devices to automatically redirect the user to the captive portal as a "sign in" screen.
   * When disabled, only domains ending in `.setup` (ex: `viam.setup`) will be redirected. This generally avoids displaying the portal to users and is mainly used in conjunction with a mobile provisioning application workflow.
-* hotspot_prefix: Defaults to `viam-setup`
-  * Will have the hostname of the device append and be used for the provisioning hotspot SSID.
 * hotspot_password: Defaults to `viamsetup`
   * Wifi password for provisioning hotspot.
-
-## Mobile App Provisioning
-If you are using the Viam mobile app, and your device has been pre-installed with the agent (per above steps) you can use the mobile app to configure your robot, instead of the captive web portal. 
-
-### Steps in Viam mobile app
-Download the Viam mobile app from [Apple App Store](https://apps.apple.com/vn/app/viam-robotics/id6451424162) or [Google Play](https://play.google.com/store/apps/details?id=com.viam.viammobile&hl=en&gl=US).
-
-Within the [Viam mobile app](https://docs.viam.com/fleet/#the-viam-mobile-app) once logged in, navigate to an organization, then to a location, then inside any location tap "Add new smart machine", and follow the instructions in app. See the mobile app documentation for further details.
-
-## User Configuration
-No configuration is neccessary for normal end-user use. Provisioning mode will start a hotspot when either not configured (no /etc/viam.json) or not online.
+* roaming_mode: Defaults to false.
+  * By default, the device will only attempt to connect to a single wifi network (the one with the highest priority), usually provided during initial provisioning/setup. Wifi connection alone is enough to consider the device as "online" even if the global internet is not reachable.
+  * When enabled, the device will attempt connections to all configured networks, and only considers the device online if the internet is reachable.
+* offline_timeout: Defaults to "2m" (2 minutes)
+  * Will only enter provisioning mode (hotspot) after being disconnected longer than this time.
+  * Useful on flaky connections, or when part of a system where the device may start quickly, but the wifi/router may take longer to be available.
+* user_timeout: Defaults to "5m" (5 minutes)
+  * Amount of time before considering a user (using the provisioning portal via web or mobile app) idle, and resuming normal behavior.
+  * Used to avoid interrupting provisioning mode (e.g. for network tests/retries) when a user might be busy entering details.
+* fallback_timeout: Defaults to "10m" (10 minutes)
+  * Provisioning mode will exit after this time, to allow other unmanaged (e.g. wired) or manually configured connections to be tried.
+  * Provisioning mode will restart if the connection/online status doesn't change.
+* networks: Defaults to none.
+  * See "Additional Networks" below.
 
 ### Additional Networks (Optional)
-To add additional networks to an already-online device, go to the "Raw JSON" button on the Config tab for your robot/device in https://app.viam.com
+To add additional networks to an already-online device, go to the JSON editor for your device's config in https://app.viam.com
 
 From there, add an `attributes` field to the agent-provisioning subsystem, using the example below.
 
 ```json
-"agent_config": {
-    "subsystems": {
-      "agent-provisioning": {
-        "release_channel": "stable",
-        "pin_version": "",
-        "pin_url": "",
-        "disable_subsystem": false,
-        "attributes": {
-          "hotspot_password": "testpass",
-          "networks": [
-            {
-              "type": "wifi",
-              "ssid": "primaryNet",
-              "psk": "myFirstPassword",
-              "priority": 30
-            },
-            {
-              "type": "wifi",
-              "ssid": "fallbackNet",
-              "psk": "mySecondPassword",
-              "priority": 10
-            }
-          ]
+"agent": {
+  "agent-provisioning": {
+    "release_channel": "stable",
+    "attributes": {
+      "hotspot_password": "testpass",
+      "roaming_mode": true,
+      "networks": [
+        {
+          "type": "wifi",
+          "ssid": "primaryNet",
+          "psk": "myFirstPassword",
+          "priority": 30
+        },
+        {
+          "type": "wifi",
+          "ssid": "fallbackNet",
+          "psk": "mySecondPassword",
+          "priority": 10
         }
-      },
+      ]
+    }
+  }
+}
 ```
-Note: the `hotspot_password` overrides the default password (either the default `viamsetup` or any factory-customized password) used to connect to the hotspot if you wish to further secure things. It is optional and can be omitted entirely.
+
+Note that adding additional networks is mostly useless unless you've also enabled roaming_mode as shown. Otherwise, the default behavior will only attempt to connect to the highest priority network. In non-roaming mode, a network added directly on the device during provisioning is set to 999 priority.
 
 ## Use
-Provisioning mode will start a hotspot when either not configured (no /etc/viam.json) or not online. By default, the wifi SSID will be `viam-setup-$HOSTNAME`. The default password is `viamsetup`. After connecting with a mobile device, you should be redirected to a sign-in page. If you are using a laptop or are not redirected, try opening http://viam.setup/ in a browswer. From the portal page, you can select an SSID and provide a password to allow your device to connect. The setup hotspot will disappear (and disconnect your mobile device) while the device attempts connection. If the hotspot reappears, there may be have been an issue or invalid password. Please try again.
+Provisioning mode will start a hotspot when either not configured (no /etc/viam.json) or not online. By default, the wifi SSID will be `viam-setup-$HOSTNAME`. The default password is `viamsetup`. After connecting to the hotspot with a mobile device, you should be redirected to a sign-in page. If you are using a laptop or are not redirected, try opening http://viam.setup/ in a browswer. From the portal page, you can select an SSID and provide a password to allow your device to connect. The setup hotspot will disappear (and disconnect your mobile device) while the device attempts connection. If the hotspot reappears, there may be have been an issue or invalid password. Please try again.
 
-### Pre-installed provisioning
+### Mobile App Provisioning
+If you are using the Viam mobile app, and your device has been pre-installed with the agent (per above steps) you can use the mobile app to configure your robot, instead of the captive web portal. 
+
+#### Steps in Viam mobile app
+Download the Viam mobile app from [Apple App Store](https://apps.apple.com/vn/app/viam-robotics/id6451424162) or [Google Play](https://play.google.com/store/apps/details?id=com.viam.viammobile&hl=en&gl=US).
+
+Within the [Viam mobile app](https://docs.viam.com/fleet/#the-viam-mobile-app) once logged in, navigate to an organization, then to a location, then inside any location tap "Add new smart machine", and follow the instructions in app. See the mobile app documentation for further details.
+
+### Pre-installed provisioning (Via web portal, not mobile app)
 If there is no `/etc/viam.json` present, the captive portal will also require you to paste the content of the viam-server config to use in `/etc/viam.json` This can be copied from the "Setup" tab of your machine in https://app.viam.com by clicking the "Copy viam-server configuration" button near the top right.
 
 ### Test CLI Utility

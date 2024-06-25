@@ -4,13 +4,14 @@ package provisioning
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"sync/atomic"
 	"time"
 
-	"github.com/pkg/errors"
+	errw "github.com/pkg/errors"
 	pb "go.viam.com/api/provisioning/v1"
 )
 
@@ -19,6 +20,20 @@ var (
 	Version     = ""
 	GitRevision = ""
 )
+
+var DefaultConf = Config{
+	Manufacturer:       "viam",
+	Model:              "custom",
+	FragmentID:         "",
+	HotspotPrefix:      "viam-setup",
+	HotspotPassword:    "viamsetup",
+	DisableDNSRedirect: false,
+	RoamingMode:        false,
+	OfflineTimeout:     Timeout(time.Minute * 2),
+	UserTimeout:        Timeout(time.Minute * 5),
+	FallbackTimeout:    Timeout(time.Minute * 10),
+	Networks:           []NetworkConfig{},
+}
 
 // GetVersion returns the version embedded at build time.
 func GetVersion() string {
@@ -34,16 +49,6 @@ func GetRevision() string {
 		return "unknown"
 	}
 	return GitRevision
-}
-
-type ProvisioningConfig struct {
-	Manufacturer string `json:"manufacturer"`
-	Model        string `json:"model"`
-	FragmentID   string `json:"fragment_id"`
-
-	HotspotPrefix      string `json:"hotspot_prefix"`
-	HotspotPassword    string `json:"hotspot_password"`
-	DisableDNSRedirect bool   `json:"disable_dns_redirect"`
 }
 
 type NetworkInfo struct {
@@ -81,7 +86,7 @@ type NetworkConfig struct {
 	Type     string `json:"type"`
 	SSID     string `json:"ssid"`
 	PSK      string `json:"psk"`
-	Priority int    `json:"priority"`
+	Priority int32  `json:"priority"`
 }
 
 // DeviceConfig represents the minimal needed for /etc/viam.json.
@@ -95,7 +100,7 @@ type CloudConfig struct {
 	Secret     string `json:"secret"`
 }
 
-func WriteDeviceConfig(file string, input *UserInput) error {
+func WriteDeviceConfig(file string, input UserInput) error {
 	if input.RawConfig != "" {
 		return os.WriteFile(file, []byte(input.RawConfig), 0o600)
 	}
@@ -131,14 +136,9 @@ type UserInput struct {
 	RawConfig string
 }
 
-func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
-	defaultConf := ProvisioningConfig{
-		Manufacturer:    "viam",
-		Model:           "custom",
-		FragmentID:      "",
-		HotspotPrefix:   "viam-setup",
-		HotspotPassword: "viamsetup",
-	}
+func LoadConfig(defaultConf Config, path string) (*Config, error) {
+	minTimeout := Timeout(time.Second * 15)
+
 	//nolint:gosec
 	jsonBytes, err := os.ReadFile(path)
 	if err != nil {
@@ -153,33 +153,89 @@ func LoadProvisioningConfig(path string) (*ProvisioningConfig, error) {
 	}
 
 	if conf.Manufacturer == "" || conf.Model == "" || conf.HotspotPrefix == "" || conf.HotspotPassword == "" {
-		return &defaultConf, errors.Errorf("values in %s cannot be empty, please omit empty fields entirely", path)
+		return &defaultConf, errw.New("values in configs/attributes should not be empty, please omit empty fields entirely")
+	}
+
+	var haveBadTimeout bool
+	if conf.OfflineTimeout < minTimeout {
+		conf.OfflineTimeout = defaultConf.OfflineTimeout
+		haveBadTimeout = true
+	}
+
+	if conf.UserTimeout < minTimeout {
+		conf.UserTimeout = defaultConf.UserTimeout
+		haveBadTimeout = true
+	}
+
+	if conf.FallbackTimeout < minTimeout {
+		conf.FallbackTimeout = defaultConf.FallbackTimeout
+		haveBadTimeout = true
+	}
+
+	if haveBadTimeout {
+		return &conf, errw.Errorf("timeout values cannot be less than %s", time.Duration(minTimeout))
 	}
 
 	return &conf, nil
 }
 
+// Config represents the json configurations parsed from either agent-provisioning.json OR passed from the "attributes" in the cloud config.
 type Config struct {
-	HotspotPassword string          `json:"hotspot_password"`
-	Networks        []NetworkConfig `json:"networks"`
+	// Things typically set in agent-provisioning.json
+	Manufacturer string `json:"manufacturer"`
+	Model        string `json:"model"`
+	FragmentID   string `json:"fragment_id"`
+
+	// The prefix to prepend to the hotspot name.
+	HotspotPrefix string `json:"hotspot_prefix"`
+	// Password required to connect to the hotspot.
+	HotspotPassword string `json:"hotspot_password"`
+	// If true, mobile (phone) users connecting to the hotspot won't be automatically redirected to the web portal.
+	DisableDNSRedirect bool `json:"disable_dns_redirect"`
+
+	// How long without a connection before starting provisioning (hotspot) mode.
+	OfflineTimeout Timeout `json:"offline_timeout"`
+
+	// How long since the last user interaction (via GRPC/app or web portal) before the state machine can resume.
+	UserTimeout Timeout `json:"user_timeout"`
+
+	// If not "online", always drop out of hotspot mode and retry everything after this time limit.
+	FallbackTimeout Timeout `json:"fallback_timeout"`
+
+	// When true, will try all known networks looking for internet (global) connectivity.
+	// Otherwise, will only try the primary wifi network and consider that sufficient if connected (regardless of global connectivity.)
+	RoamingMode bool `json:"roaming_mode"`
+
+	// Additional networks to add/configure. Only useful in RoamingMode.
+	Networks []NetworkConfig `json:"networks"`
 }
 
-func LoadConfig(path string) (*Config, error) {
-	//nolint:gosec
-	jsonBytes, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return &Config{}, nil
+// Timeout allows parsing golang-style durations (1h20m30s) OR seconds-as-float from/to json.
+type Timeout time.Duration
+
+func (t Timeout) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(t).String())
+}
+
+func (t *Timeout) UnmarshalJSON(b []byte) error {
+	var v interface{}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	switch value := v.(type) {
+	case float64:
+		*t = Timeout(value * float64(time.Second))
+		return nil
+	case string:
+		tmp, err := time.ParseDuration(value)
+		if err != nil {
+			return err
 		}
-		return &Config{}, err
+		*t = Timeout(tmp)
+		return nil
+	default:
+		return errw.Errorf("invalid duration: %+v", v)
 	}
-
-	newConfig := &Config{}
-	if err = json.Unmarshal(jsonBytes, newConfig); err != nil {
-		return &Config{}, err
-	}
-
-	return newConfig, nil
 }
 
 type ContextKey string
@@ -222,5 +278,14 @@ func HealthySleep(ctx context.Context, timeout time.Duration) bool {
 		case <-time.After(timeout):
 			return true
 		}
+	}
+}
+
+func Sleep(ctx context.Context, timeout time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(timeout):
+		return true
 	}
 }

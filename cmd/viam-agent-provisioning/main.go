@@ -66,31 +66,31 @@ func main() {
 	ctx := setupExitSignalHandling()
 	defer activeBackgroundWorkers.Wait()
 
-	pCfg, err := provisioning.LoadProvisioningConfig(opts.ProvisioningConfig)
+	// Manufacturer settings from agent-provisioning.json
+	pCfg, err := provisioning.LoadConfig(provisioning.DefaultConf, opts.ProvisioningConfig)
 	if err != nil {
 		log.Error(errw.Wrapf(err, "error loading %s, using defaults", opts.ProvisioningConfig))
 	}
 
-	cfg, err := provisioning.LoadConfig(opts.Config)
+	// User settings from the "attributes" section of the cloud config (passed from parent agent via json file)
+	cfg, err := provisioning.LoadConfig(*pCfg, opts.Config)
 	if err != nil {
-		log.Warn(err)
+		log.Error(errw.Wrapf(err, "error loading %s, using defaults", opts.Config))
 	}
 
-	// If user settings override the hotspot password, use that instead
-	if cfg.HotspotPassword != "" {
-		pCfg.HotspotPassword = cfg.HotspotPassword
-	}
-
-	nm, err := netman.NewNMWrapper(ctx, log, pCfg, opts.AppConfig)
+	nm, err := netman.NewNMWrapper(ctx, log, cfg, opts.AppConfig)
 	if err != nil {
 		log.Error(err)
 		return
 	}
 	defer nm.Close()
 
+	if !cfg.RoamingMode && len(cfg.Networks) > 0 {
+		log.Warn("Additional networks configured, but Roaming Mode is not enabled. Additional wifi networks will likely be unused.")
+	}
+
 	for _, network := range cfg.Networks {
-		log.Debugf("adding/updating NetworkManager configuration for %s", network.SSID)
-		if err := nm.AddOrUpdateConnection(network); err != nil {
+		if _, err := nm.AddOrUpdateConnection(network); err != nil {
 			log.Error(errw.Wrapf(err, "error adding network %s", network.SSID))
 		}
 	}

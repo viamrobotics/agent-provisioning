@@ -10,6 +10,8 @@ import (
 	pb "go.viam.com/api/provisioning/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/viamrobotics/agent-provisioning/networkmanager"
 )
 
 func main() {
@@ -133,7 +135,7 @@ func SetDeviceCreds(ctx context.Context, client pb.ProvisioningServiceClient, id
 
 func SetWifiCreds(ctx context.Context, client pb.ProvisioningServiceClient, ssid, psk string) {
 	req := &pb.SetNetworkCredentialsRequest{
-		Type: "wifi",
+		Type: networkmanager.NetworkTypeWifi,
 		Ssid: ssid,
 		Psk:  psk,
 	}

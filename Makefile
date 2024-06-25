@@ -6,8 +6,10 @@ else ifeq ($(GOARCH),arm64)
 LINUX_ARCH = aarch64
 endif
 
-GIT_REVISION = $(shell git rev-parse HEAD | tr -d '\n')
-TAG_VERSION ?= $(shell git tag --points-at | sort -Vr | head -n1 | cut -c2-)
+ifeq ($(shell git status -s),)
+	TAG_VERSION ?= $(shell git tag --points-at | sort -Vr | head -n1 | cut -c2-)
+	GIT_REVISION = $(shell git rev-parse HEAD | tr -d '\n')
+endif
 ifeq ($(TAG_VERSION),)
 PATH_VERSION = custom
 else
@@ -30,7 +32,7 @@ arm64:
 amd64:
 	make GOARCH=amd64
 
-bin/viam-agent-provisioning-$(PATH_VERSION)-$(LINUX_ARCH): go.* *.go */*.go */*/*.go portal/templates/*
+bin/viam-agent-provisioning-$(PATH_VERSION)-$(LINUX_ARCH): go.* *.go */*.go */*/*.go networkmanager/templates/*
 	go build -o $@ -tags $(TAGS) -ldflags $(LDFLAGS) ./cmd/viam-agent-provisioning/main.go
 	test "$(PATH_VERSION)" != "custom" && cp $@ bin/viam-agent-provisioning-stable-$(LINUX_ARCH) || true
 
