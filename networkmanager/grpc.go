@@ -41,7 +41,6 @@ func (w *NMWrapper) GetSmartMachineStatus(ctx context.Context,
 	defer w.dataMu.Unlock()
 
 	w.state.setLastInteraction()
-	lastNetwork := w.networks[w.lastSSID].getInfo()
 
 	ret := &pb.GetSmartMachineStatusResponse{
 		ProvisioningInfo: &pb.ProvisioningInfo{
@@ -51,8 +50,13 @@ func (w *NMWrapper) GetSmartMachineStatus(ctx context.Context,
 		},
 		HasSmartMachineCredentials: w.state.getConfigured(),
 		IsOnline:                   w.state.getOnline(),
-		LatestConnectionAttempt:    provisioning.NetworkInfoToProto(&lastNetwork),
 		Errors:                     w.errListAsStrings(),
+	}
+
+	lastNetwork, ok := w.networks[w.lastSSID]
+	if ok {
+		lastNetworkInfo := lastNetwork.getInfo()
+		ret.LatestConnectionAttempt = provisioning.NetworkInfoToProto(&lastNetworkInfo)
 	}
 
 	// reset the errors, as they were now just displayed
@@ -78,8 +82,11 @@ func (w *NMWrapper) SetNetworkCredentials(ctx context.Context,
 	w.input.PSK = req.GetPsk()
 	w.inputReceived.Store(true)
 
-	if req.GetSsid() == w.lastSSID {
-		w.networks[w.lastSSID].lastError = nil
+	if req.GetSsid() == w.lastSSID && w.lastSSID != "" {
+		lastNetwork, ok := w.networks[w.lastSSID]
+		if ok {
+			lastNetwork.lastError = nil
+		}
 	}
 
 	return &pb.SetNetworkCredentialsResponse{}, nil

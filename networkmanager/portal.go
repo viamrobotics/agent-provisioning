@@ -204,8 +204,11 @@ func (w *NMWrapper) portalSave(resp http.ResponseWriter, req *http.Request) {
 			w.banner += "Added credentials for SSID: " + w.input.SSID
 		}
 
-		if ssid == w.lastSSID && w.networks[w.lastSSID] != nil {
-			w.networks[w.lastSSID].lastError = nil
+		if ssid == w.lastSSID && ssid != "" {
+			lastNetwork, ok := w.networks[w.lastSSID]
+			if ok {
+				lastNetwork.lastError = nil
+			}
 		}
 		w.input.Updated = time.Now()
 		w.inputReceived.Store(true)
