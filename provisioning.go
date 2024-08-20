@@ -84,27 +84,27 @@ func NetworkInfoFromProto(buf *pb.NetworkInfo) *NetworkInfo {
 
 type NetworkConfig struct {
 	// "wifi", "wired", "wifi-static", "wired-static"
-	Type     string `json:"type"`
+	Type string `json:"type"`
 
 	// name of interface, ex: "wlan0", "eth0", "enp14s0", etc.
 	Interface string `json:"interface"`
 
 	// Wifi Settings
-	SSID     string `json:"ssid"`
-	PSK      string `json:"psk"`
+	SSID string `json:"ssid"`
+	PSK  string `json:"psk"`
 
-	// Autoconnect Priority (primarly for wifi)
+	// Autoconnect Priority (primarily for wifi)
 	// higher values are preferred/tried first
 	// defaults to 0, but wifi networks added via hotspot are set to 999 when not in roaming mode
-	Priority int32  `json:"priority"`
+	Priority int32 `json:"priority"`
 
 	// CIDR format address, ex: 192.168.0.1/24
 	// If unset, will default to "auto" (dhcp)
-	IPv4Address     string `json:"ipv4_address"`
-	IPv4Gateway     string `json:"ipv4_gateway"`
+	IPv4Address string `json:"ipv4_address"`
+	IPv4Gateway string `json:"ipv4_gateway"`
 
 	// optional
-	IPv4DNS         []string `json:"ipv4_dns"`
+	IPv4DNS []string `json:"ipv4_dns"`
 
 	// optional, 0 or -1 is default
 	// lower values are preferred (lower "cost")
@@ -114,10 +114,9 @@ type NetworkConfig struct {
 }
 
 const (
-	NetworkWifi = "wifi"
+	NetworkWifi  = "wifi"
 	NetworkWired = "wired"
 )
-
 
 // DeviceConfig represents the minimal needed for /etc/viam.json.
 type DeviceConfig struct {
@@ -251,7 +250,7 @@ func (t Timeout) MarshalJSON() ([]byte, error) {
 }
 
 func (t *Timeout) UnmarshalJSON(b []byte) error {
-	var v interface{}
+	var v any
 	if err := json.Unmarshal(b, &v); err != nil {
 		return err
 	}

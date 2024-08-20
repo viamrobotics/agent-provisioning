@@ -4,7 +4,6 @@ package networkmanager
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -54,7 +53,6 @@ func (w *NMWrapper) NetworkScan(ctx context.Context) error {
 	now := time.Now()
 	for _, ap := range wifiList {
 		if ctx.Err() != nil {
-			//nolint:nilerr
 			return nil
 		}
 		ssid, err := ap.GetPropertySSID()
@@ -109,7 +107,6 @@ func (w *NMWrapper) NetworkScan(ctx context.Context) error {
 
 	for _, nw := range w.networks {
 		if ctx.Err() != nil {
-			//nolint:nilerr
 			return nil
 		}
 
@@ -186,7 +183,7 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 		nw, ok := w.networks[netKey]
 		if !ok {
 			nw = &network{
-				netType: netType,
+				netType:       netType,
 				interfaceName: ifName,
 			}
 			if netType == NetworkTypeWifi {
@@ -267,7 +264,7 @@ func getKeyIfNameTypeFromSettings(settings gnm.ConnectionSettings) (string, stri
 	}
 
 	ifName := "any"
-	conn, ok  := settings["connection"]
+	conn, ok := settings["connection"]
 	if ok {
 		ifKey, ok := conn["interface-name"]
 		if ok {
@@ -279,7 +276,7 @@ func getKeyIfNameTypeFromSettings(settings gnm.ConnectionSettings) (string, stri
 	}
 
 	if wired {
-		return ifName, ifName, NetworkTypeWired
+		return genNetKey(ifName, ""), ifName, NetworkTypeWired
 	}
 
 	if wireless {
@@ -287,7 +284,7 @@ func getKeyIfNameTypeFromSettings(settings gnm.ConnectionSettings) (string, stri
 		if ssid == "" {
 			return "", "", ""
 		}
-		return fmt.Sprintf("%s@%s", ifName, ssid), ifName, NetworkTypeWifi
+		return genNetKey(ifName, ssid), ifName, NetworkTypeWifi
 	}
 
 	return "", "", ""

@@ -104,13 +104,14 @@ func (w *NMWrapper) initWifiDev() error {
 		if devType == gnm.NmDeviceTypeWifi && w.dev == nil {
 			wifiDev, ok := device.(gnm.DeviceWireless)
 			if ok {
-				ifName, err := w.dev.GetPropertyInterface()
+				ifName, err := wifiDev.GetPropertyInterface()
 				if err != nil {
 					return err
 				}
 				if w.hotspotInterface == "" || ifName == w.cfg.HotspotInterface {
 					w.hotspotInterface = ifName
 					w.dev = wifiDev
+					w.logger.Info("Using %s for hotspot/provisioning, will actively manage wifi only on this device.", ifName)
 				}
 			}
 		}

@@ -3,6 +3,7 @@ package networkmanager
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -27,8 +28,8 @@ const (
 	ConnCheckContents = "[connectivity]\nuri=http://packages.viam.com/check_network_status.txt\ninterval=300\n"
 
 	NetworkTypeWifi    = "wifi"
-	NetworkTypeHotspot = "hotspot"
 	NetworkTypeWired   = "wired"
+	NetworkTypeHotspot = "hotspot"
 )
 
 var (
@@ -64,23 +65,24 @@ type NMWrapper struct {
 	state *connectionState
 
 	// locking for data updates
-	dataMu      sync.Mutex
+	dataMu sync.Mutex
 
-	// key is interface@ssid for wifi, ex: wlan0@TestNetwork
-	// interface may be "any" for no interface set, ex: any@TestNetwork
+	// key is ssid@interface for wifi, ex: TestNetwork@wlan0
+	// interface may be "any" for no interface set, ex: TestNetwork@any
 	// wired networks are just interface, ex: eth0
-	networks    map[string]*network
+	// generate with genNetKey(ifname, ssid)
+	networks map[string]*network
 
 	// the wifi device used by provisioning and actively managed for connectivity
 	hotspotInterface string
-	hotspotSSID string
-	lastSSID    string
+	hotspotSSID      string
 
 	// key is interface name, ex: wlan0
 	primarySSID map[string]string
 	activeSSID  map[string]string
+	lastSSID    map[string]string
 
-	errors      []error
+	errors []error
 
 	// portal
 	webServer  *http.Server
@@ -127,4 +129,15 @@ func (n *network) getInfo() provisioning.NetworkInfo {
 		Connected: n.connected,
 		LastError: errStr,
 	}
+}
+
+func genNetKey(ifName, ssid string) string {
+	if ifName == "" {
+		ifName = "any"
+	}
+
+	if ssid == "" {
+		return ifName
+	}
+	return fmt.Sprintf("%s@%s", ssid, ifName)
 }

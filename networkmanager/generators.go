@@ -10,6 +10,7 @@ import (
 	gnm "github.com/Otterverse/gonetworkmanager/v2"
 	"github.com/google/uuid"
 	errw "github.com/pkg/errors"
+
 	provisioning "github.com/viamrobotics/agent-provisioning"
 )
 
@@ -42,7 +43,6 @@ func generateHotspotSettings(id, ssid, psk string) gnm.ConnectionSettings {
 	return settings
 }
 
-
 func generateNetworkSettings(id string, cfg provisioning.NetworkConfig) (gnm.ConnectionSettings, error) {
 	settings := gnm.ConnectionSettings{}
 	if id == "" {
@@ -59,12 +59,12 @@ func generateNetworkSettings(id string, cfg provisioning.NetworkConfig) (gnm.Con
 		return nil, errw.Errorf("unknown network type: %s", cfg.Type)
 	}
 
-	settings["connection"]= map[string]any{
-			"id":                   id,
-			"uuid":                 uuid.New().String(),
-			"type":                 netType,
-			"autoconnect":          true,
-			"autoconnect-priority": cfg.Priority,
+	settings["connection"] = map[string]any{
+		"id":                   id,
+		"uuid":                 uuid.New().String(),
+		"type":                 netType,
+		"autoconnect":          true,
+		"autoconnect-priority": cfg.Priority,
 	}
 
 	if cfg.Interface != "" {
@@ -125,8 +125,8 @@ func generateIPv4Settings(cfg provisioning.NetworkConfig) (map[string]any, error
 	}
 
 	ip4 := map[string]any{
-		"method": "manual",
-		"addresses": [][]uint32{{ip, uint32(mask), gateway}},
+		"method":       "manual",
+		"addresses":    [][]uint32{{ip, uint32(mask), gateway}},
 		"route-metric": cfg.IPv4RouteMetric,
 	}
 
@@ -137,7 +137,7 @@ func generateIPv4Settings(cfg provisioning.NetworkConfig) (map[string]any, error
 			if err != nil {
 				return nil, errw.Errorf("error parsing DNS ipv4 address: %s", dns)
 			}
-			dnsData = append(dnsData, dnsInt) 
+			dnsData = append(dnsData, dnsInt)
 		}
 		ip4["dns"] = dnsData
 	}
@@ -145,23 +145,24 @@ func generateIPv4Settings(cfg provisioning.NetworkConfig) (map[string]any, error
 	return ip4, nil
 }
 
-// converts an ipv4 string (192.168.0.1) to a uint32 in network byte order
+// converts an ipv4 string (192.168.0.1) to a uint32 in network byte order.
 func generateAddress(addr string) (uint32, error) {
+	parseErr := errw.Errorf("parsing ipv4: %s", addr)
 	// double-check with another library for correctness
 	if net.ParseIP(addr) == nil {
-		errw.Errorf("parsing ipv4: %s", addr)
+		return 0, parseErr
 	}
 
 	ret := strings.Split(addr, ".")
 	if len(ret) != 4 {
-		return 0, errw.Errorf("parsing ipv4: %s", addr)
+		return 0, parseErr
 	}
 
 	var outBytes []byte
 	for _, nibble := range ret {
 		b, err := strconv.ParseUint(nibble, 10, 8)
 		if err != nil {
-			return 0, errw.Errorf("parsing ipv4: %s", addr)
+			return 0, parseErr
 		}
 		outBytes = append(outBytes, byte(b))
 	}

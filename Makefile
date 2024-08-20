@@ -41,7 +41,7 @@ clean:
 	rm -rf bin/
 
 bin/golangci-lint:
-	GOBIN=`pwd`/bin go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.55.2
+	GOBIN=`pwd`/bin go install github.com/golangci/golangci-lint/cmd/golangci-lint@1.60.1
 
 .PHONY: lint
 lint: bin/golangci-lint
