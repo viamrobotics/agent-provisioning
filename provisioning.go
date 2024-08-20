@@ -83,11 +83,41 @@ func NetworkInfoFromProto(buf *pb.NetworkInfo) *NetworkInfo {
 }
 
 type NetworkConfig struct {
+	// "wifi", "wired", "wifi-static", "wired-static"
 	Type     string `json:"type"`
+
+	// name of interface, ex: "wlan0", "eth0", "enp14s0", etc.
+	Interface string `json:"interface"`
+
+	// Wifi Settings
 	SSID     string `json:"ssid"`
 	PSK      string `json:"psk"`
+
+	// Autoconnect Priority (primarly for wifi)
+	// higher values are preferred/tried first
+	// defaults to 0, but wifi networks added via hotspot are set to 999 when not in roaming mode
 	Priority int32  `json:"priority"`
+
+	// CIDR format address, ex: 192.168.0.1/24
+	// If unset, will default to "auto" (dhcp)
+	IPv4Address     string `json:"ipv4_address"`
+	IPv4Gateway     string `json:"ipv4_gateway"`
+
+	// optional
+	IPv4DNS         []string `json:"ipv4_dns"`
+
+	// optional, 0 or -1 is default
+	// lower values are preferred (lower "cost")
+	// wired networks default to 100
+	// wireless networks default to 600
+	IPv4RouteMetric int64 `json:"ipv4_route_metric"`
 }
+
+const (
+	NetworkWifi = "wifi"
+	NetworkWired = "wired"
+)
+
 
 // DeviceConfig represents the minimal needed for /etc/viam.json.
 type DeviceConfig struct {
@@ -186,6 +216,9 @@ type Config struct {
 	Model        string `json:"model"`
 	FragmentID   string `json:"fragment_id"`
 
+	// The interface to use for hotspot/provisioning/wifi management. Ex: "wlan0"
+	// Defaults to the first discovered 802.11 device
+	HotspotInterface string `json:"hotspot_interface"`
 	// The prefix to prepend to the hotspot name.
 	HotspotPrefix string `json:"hotspot_prefix"`
 	// Password required to connect to the hotspot.

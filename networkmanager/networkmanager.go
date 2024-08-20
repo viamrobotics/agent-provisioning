@@ -40,7 +40,9 @@ func NewNMWrapper(
 		logger:      logger,
 		nm:          nm,
 		settings:    settings,
-		networks:    make(map[string]*network),
+		networks: make(map[string]*network),
+		activeSSID:     make(map[string]string),
+		primarySSID:    make(map[string]string),
 		state:       &connectionState{logger: logger},
 		input:       &provisioning.UserInput{},
 	}
@@ -196,7 +198,7 @@ func (w *NMWrapper) CheckConnection() error {
 	defer w.opMu.Unlock()
 	var connected bool
 	defer func() {
-		if connected && w.activeSSID != "" {
+		if connected && w.activeSSID[w.hotspotInterface] != "" {
 			w.logger.Debugf("Connected to: %s", w.activeSSID)
 		}
 		w.state.setConnected(connected)
@@ -226,11 +228,11 @@ func (w *NMWrapper) CheckConnection() error {
 	w.dataMu.Lock()
 	defer w.dataMu.Unlock()
 
-	w.activeSSID = ssid
-	activeNetwork, ok := w.networks[w.activeSSID]
+	w.activeSSID[w.hotspotInterface] = ssid
+	activeNetwork, ok := w.networks[w.activeSSID[w.hotspotInterface]]
 	if !ok {
 		err := errw.Errorf("active network not found in network list: %s", w.activeSSID)
-		w.activeSSID = ""
+		w.activeSSID[w.hotspotInterface] = ""
 		return err
 	}
 
@@ -242,17 +244,17 @@ func (w *NMWrapper) CheckConnection() error {
 		// active connection will be removed from dbus once its no longer active, so we nil it out
 		activeNetwork.activeConn = nil
 		activeNetwork.connected = false
-		w.activeSSID = ""
+		w.activeSSID[w.hotspotInterface] = ""
 		return err
 	}
 	// in roaming mode, we don't care WHAT network is connected
-	if w.cfg.RoamingMode && state == gnm.NmActiveConnectionStateActivated && w.activeSSID != w.hotspotSSID {
+	if w.cfg.RoamingMode && state == gnm.NmActiveConnectionStateActivated && w.activeSSID[w.hotspotInterface] != w.hotspotSSID {
 		connected = true
 		return nil
 	}
 
 	// in normal (single) mode, we need to be connected to the primary (highest priority) network
-	if state == gnm.NmActiveConnectionStateActivated && w.activeSSID == w.primarySSID {
+	if state == gnm.NmActiveConnectionStateActivated && w.activeSSID[w.hotspotInterface] == w.primarySSID[w.hotspotInterface] {
 		connected = true
 	}
 
@@ -342,7 +344,7 @@ func (w *NMWrapper) activateConnection(ctx context.Context, ssid string) error {
 	nw.lastConnected = now
 	nw.activeConn = activeConnection
 	nw.lastError = nil
-	w.activeSSID = ssid
+	w.activeSSID[w.hotspotInterface] = ssid
 
 	w.logger.Infof("Successfully activated connection for SSID: %s", ssid)
 
@@ -378,7 +380,7 @@ func (w *NMWrapper) deactivateConnection(ssid string) error {
 	nw.lastConnected = time.Now()
 	nw.activeConn = nil
 	nw.lastError = nil
-	w.activeSSID = ""
+	w.activeSSID[w.hotspotInterface] = ""
 	return nil
 }
 
@@ -451,7 +453,10 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) (bool,
 	nw.lastTried = time.Time{}
 	nw.priority = cfg.Priority
 
-	settings := generateWifiSettings(w.cfg.Manufacturer+"-"+cfg.SSID, cfg.SSID, cfg.PSK, cfg.Priority)
+	settings, err := generateNetworkSettings(w.cfg.Manufacturer+"-"+cfg.SSID, cfg)
+	if err != nil {
+		return false, err
+	}
 	if cfg.Type == NetworkTypeHotspot {
 		if cfg.SSID != w.hotspotSSID {
 			return newNetwork, errw.Errorf("only the builtin provisioning hotspot may use the %s network type", NetworkTypeHotspot)
@@ -463,7 +468,7 @@ func (w *NMWrapper) addOrUpdateConnection(cfg provisioning.NetworkConfig) (bool,
 	if !w.cfg.RoamingMode && cfg.Priority == 999 {
 		// lower the priority of any existing/prior primary network
 		w.lowerMaxNetPriorities(cfg.SSID)
-		w.primarySSID = cfg.SSID
+		w.primarySSID[w.hotspotInterface] = cfg.SSID
 	}
 
 	w.logger.Infof("Adding/updating settings for SSID %s", cfg.SSID)
@@ -572,7 +577,7 @@ func (w *NMWrapper) getCandidates() []string {
 
 	if !w.cfg.RoamingMode {
 		for _, ssid := range candidates {
-			if ssid == w.primarySSID {
+			if ssid == w.primarySSID[w.hotspotInterface] {
 				return []string{ssid}
 			}
 		}

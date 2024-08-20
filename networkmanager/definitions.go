@@ -28,6 +28,7 @@ const (
 
 	NetworkTypeWifi    = "wifi"
 	NetworkTypeHotspot = "hotspot"
+	NetworkTypeWired   = "wired"
 )
 
 var (
@@ -64,11 +65,21 @@ type NMWrapper struct {
 
 	// locking for data updates
 	dataMu      sync.Mutex
+
+	// key is interface@ssid for wifi, ex: wlan0@TestNetwork
+	// interface may be "any" for no interface set, ex: any@TestNetwork
+	// wired networks are just interface, ex: eth0
 	networks    map[string]*network
+
+	// the wifi device used by provisioning and actively managed for connectivity
+	hotspotInterface string
 	hotspotSSID string
-	activeSSID  string
 	lastSSID    string
-	primarySSID string
+
+	// key is interface name, ex: wlan0
+	primarySSID map[string]string
+	activeSSID  map[string]string
+
 	errors      []error
 
 	// portal
@@ -96,6 +107,7 @@ type network struct {
 	connected     bool
 	lastConnected time.Time
 	lastError     error
+	interfaceName string
 
 	conn       gnm.Connection
 	activeConn gnm.ActiveConnection

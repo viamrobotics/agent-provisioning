@@ -5,7 +5,6 @@ package networkmanager
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 
@@ -96,13 +95,30 @@ func (w *NMWrapper) initWifiDev() error {
 		if err != nil {
 			return err
 		}
-		if devType == gnm.NmDeviceTypeWifi {
+		if devType == gnm.NmDeviceTypeEthernet || devType == gnm.NmDeviceTypeWifi {
+			if err := device.SetPropertyAutoConnect(true); err != nil {
+				return err
+			}
+		}
+
+		if devType == gnm.NmDeviceTypeWifi && w.dev == nil {
 			wifiDev, ok := device.(gnm.DeviceWireless)
 			if ok {
-				w.dev = wifiDev
-				return w.dev.SetPropertyAutoConnect(true)
+				ifName, err := w.dev.GetPropertyInterface()
+				if err != nil {
+					return err
+				}
+				if w.hotspotInterface == "" || ifName == w.cfg.HotspotInterface {
+					w.hotspotInterface = ifName
+					w.dev = wifiDev
+				}
 			}
 		}
 	}
-	return fmt.Errorf("cannot find wifi device")
+
+	if w.dev != nil {
+		return nil
+	}
+
+	return errors.New("cannot find wifi device for provisioning/hotspot")
 }
