@@ -17,21 +17,26 @@ func (w *NMWrapper) NetworkScan(ctx context.Context) error {
 	w.opMu.Lock()
 	defer w.opMu.Unlock()
 
-	prevScan, err := w.dev.GetPropertyLastScan()
+	wifiDev, ok := w.wifiDevices[w.hotspotInterface]
+	if !ok {
+		return errw.Errorf("cannot find hotspot interface: %s", w.hotspotInterface)
+	}
+
+	prevScan, err := wifiDev.GetPropertyLastScan()
 	if err != nil {
 		return errw.Wrap(err, "error scanning wifi")
 	}
 
-	err = w.dev.RequestScan()
+	err = wifiDev.RequestScan()
 	if err != nil {
-		return errw.Wrap(err, "error scanning wifi")
+		return errw.Wrap(err, "scanning wifi")
 	}
 
 	var lastScan int64
 	for {
-		lastScan, err = w.dev.GetPropertyLastScan()
+		lastScan, err = wifiDev.GetPropertyLastScan()
 		if err != nil {
-			return errw.Wrap(err, "error scanning wifi")
+			return errw.Wrap(err, "scanning wifi")
 		}
 		if lastScan > prevScan {
 			break
@@ -41,9 +46,9 @@ func (w *NMWrapper) NetworkScan(ctx context.Context) error {
 		}
 	}
 
-	wifiList, err := w.dev.GetAccessPoints()
+	wifiList, err := wifiDev.GetAccessPoints()
 	if err != nil {
-		return errw.Wrap(err, "error scanning wifi")
+		return errw.Wrap(err, "scanning wifi")
 	}
 
 	w.dataMu.Lock()
@@ -276,7 +281,7 @@ func getKeyIfNameTypeFromSettings(settings gnm.ConnectionSettings) (string, stri
 	}
 
 	if wired {
-		return genNetKey(ifName, ""), ifName, NetworkTypeWired
+		return GenNetKey(ifName, ""), ifName, NetworkTypeWired
 	}
 
 	if wireless {
@@ -284,7 +289,7 @@ func getKeyIfNameTypeFromSettings(settings gnm.ConnectionSettings) (string, stri
 		if ssid == "" {
 			return "", "", ""
 		}
-		return genNetKey(ifName, ssid), ifName, NetworkTypeWifi
+		return GenNetKey(ifName, ssid), ifName, NetworkTypeWifi
 	}
 
 	return "", "", ""

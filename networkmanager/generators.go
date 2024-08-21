@@ -2,6 +2,7 @@ package networkmanager
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"regexp"
 	"strconv"
@@ -16,13 +17,14 @@ import (
 
 // This file contains the wifi/hotspot setting generation functions.
 
-func generateHotspotSettings(id, ssid, psk string) gnm.ConnectionSettings {
+func generateHotspotSettings(id, ssid, psk, ifName string) gnm.ConnectionSettings {
 	settings := gnm.ConnectionSettings{
 		"connection": map[string]any{
-			"id":          id,
-			"uuid":        uuid.New().String(),
-			"type":        "802-11-wireless",
-			"autoconnect": false,
+			"id":             id,
+			"uuid":           uuid.New().String(),
+			"type":           "802-11-wireless",
+			"autoconnect":    false,
+			"interface-name": ifName,
 		},
 		"802-11-wireless": map[string]any{
 			"mode": "ap",
@@ -168,4 +170,15 @@ func generateAddress(addr string) (uint32, error) {
 	}
 
 	return binary.LittleEndian.Uint32(outBytes), nil
+}
+
+func GenNetKey(ifName, ssid string) string {
+	if ifName == "" {
+		ifName = "any"
+	}
+
+	if ssid == "" {
+		return ifName
+	}
+	return fmt.Sprintf("%s@%s", ssid, ifName)
 }

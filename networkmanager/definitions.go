@@ -3,7 +3,6 @@ package networkmanager
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -54,7 +53,6 @@ type NMWrapper struct {
 
 	// only set during NewNMWrapper, no lock
 	nm          gnm.NetworkManager
-	dev         gnm.DeviceWireless
 	settings    gnm.Settings
 	hostname    string
 	logger      *zap.SugaredLogger
@@ -81,6 +79,9 @@ type NMWrapper struct {
 	primarySSID map[string]string
 	activeSSID  map[string]string
 	lastSSID    map[string]string
+	activeConn  map[string]gnm.ActiveConnection
+	ethDevices  map[string]gnm.DeviceWired
+	wifiDevices map[string]gnm.DeviceWireless
 
 	errors []error
 
@@ -111,8 +112,7 @@ type network struct {
 	lastError     error
 	interfaceName string
 
-	conn       gnm.Connection
-	activeConn gnm.ActiveConnection
+	conn gnm.Connection
 }
 
 func (n *network) getInfo() provisioning.NetworkInfo {
@@ -129,15 +129,4 @@ func (n *network) getInfo() provisioning.NetworkInfo {
 		Connected: n.connected,
 		LastError: errStr,
 	}
-}
-
-func genNetKey(ifName, ssid string) string {
-	if ifName == "" {
-		ifName = "any"
-	}
-
-	if ssid == "" {
-		return ifName
-	}
-	return fmt.Sprintf("%s@%s", ssid, ifName)
 }
