@@ -5,7 +5,6 @@ package networkmanager
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 
@@ -85,7 +84,7 @@ func (w *NMWrapper) writeConnCheck() error {
 	return os.WriteFile(ConnCheckFilepath, []byte(ConnCheckContents), 0o644)
 }
 
-func (w *NMWrapper) initWifiDev() error {
+func (w *NMWrapper) initDevices() error {
 	devices, err := w.nm.GetDevices()
 	if err != nil {
 		return err
@@ -96,13 +95,46 @@ func (w *NMWrapper) initWifiDev() error {
 		if err != nil {
 			return err
 		}
-		if devType == gnm.NmDeviceTypeWifi {
-			wifiDev, ok := device.(gnm.DeviceWireless)
-			if ok {
-				w.dev = wifiDev
-				return w.dev.SetPropertyAutoConnect(true)
+
+		//nolint:exhaustive
+		switch devType {
+		case gnm.NmDeviceTypeEthernet:
+			ethDev, ok := device.(gnm.DeviceWired)
+			if !ok {
+				return errors.New("cannot cast to wired device")
 			}
+			ifName, err := ethDev.GetPropertyInterface()
+			if err != nil {
+				return err
+			}
+			w.ethDevices[ifName] = ethDev
+		case gnm.NmDeviceTypeWifi:
+			wifiDev, ok := device.(gnm.DeviceWireless)
+			if !ok {
+				return errors.New("cannot cast to wifi device")
+			}
+			ifName, err := wifiDev.GetPropertyInterface()
+			if err != nil {
+				return err
+			}
+			w.wifiDevices[ifName] = wifiDev
+
+			if w.hotspotInterface == "" || ifName == w.cfg.HotspotInterface {
+				w.hotspotInterface = ifName
+				w.logger.Infof("Using %s for hotspot/provisioning, will actively manage wifi only on this device.", ifName)
+			}
+		default:
+			continue
+		}
+
+		if err := device.SetPropertyAutoConnect(true); err != nil {
+			return err
 		}
 	}
-	return fmt.Errorf("cannot find wifi device")
+
+	if w.hotspotInterface == "" {
+		return errors.New("cannot find wifi device for provisioning/hotspot")
+	}
+
+	return nil
 }

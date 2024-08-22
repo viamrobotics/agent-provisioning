@@ -89,14 +89,20 @@ func main() {
 		log.Warn("Additional networks configured, but Roaming Mode is not enabled. Additional wifi networks will likely be unused.")
 	}
 
-	for _, network := range cfg.Networks {
-		if _, err := nm.AddOrUpdateConnection(network); err != nil {
-			log.Error(errw.Wrapf(err, "error adding network %s", network.SSID))
-		}
-	}
-
 	// exact text is important, the parent process will watch for this line to indicate startup is successful
 	log.Info("agent-provisioning startup complete")
+
+	for _, network := range cfg.Networks {
+		_, err := nm.AddOrUpdateConnection(network)
+		if err != nil {
+			log.Error(errw.Wrapf(err, "error adding network %s", network.SSID))
+		}
+		if network.Interface != "" && nm.GetHotspotInterface() != network.Interface {
+			if err := nm.ActivateConnection(ctx, network.Interface, network.SSID); err != nil {
+				log.Error(err)
+			}
+		}
+	}
 
 	// this will loop indefinitely until context cancellation or serious error
 	if err := nm.StartMonitoring(ctx); err != nil && !errors.Is(err, context.Canceled) {

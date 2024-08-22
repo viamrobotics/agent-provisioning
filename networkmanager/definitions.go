@@ -27,6 +27,7 @@ const (
 	ConnCheckContents = "[connectivity]\nuri=http://packages.viam.com/check_network_status.txt\ninterval=300\n"
 
 	NetworkTypeWifi    = "wifi"
+	NetworkTypeWired   = "wired"
 	NetworkTypeHotspot = "hotspot"
 )
 
@@ -52,7 +53,6 @@ type NMWrapper struct {
 
 	// only set during NewNMWrapper, no lock
 	nm          gnm.NetworkManager
-	dev         gnm.DeviceWireless
 	settings    gnm.Settings
 	hostname    string
 	logger      *zap.SugaredLogger
@@ -63,13 +63,27 @@ type NMWrapper struct {
 	state *connectionState
 
 	// locking for data updates
-	dataMu      sync.Mutex
-	networks    map[string]*network
-	hotspotSSID string
-	activeSSID  string
-	lastSSID    string
-	primarySSID string
-	errors      []error
+	dataMu sync.Mutex
+
+	// key is ssid@interface for wifi, ex: TestNetwork@wlan0
+	// interface may be "any" for no interface set, ex: TestNetwork@any
+	// wired networks are just interface, ex: eth0
+	// generate with genNetKey(ifname, ssid)
+	networks map[string]*network
+
+	// the wifi device used by provisioning and actively managed for connectivity
+	hotspotInterface string
+	hotspotSSID      string
+
+	// key is interface name, ex: wlan0
+	primarySSID map[string]string
+	activeSSID  map[string]string
+	lastSSID    map[string]string
+	activeConn  map[string]gnm.ActiveConnection
+	ethDevices  map[string]gnm.DeviceWired
+	wifiDevices map[string]gnm.DeviceWireless
+
+	errors []error
 
 	// portal
 	webServer  *http.Server
@@ -96,9 +110,9 @@ type network struct {
 	connected     bool
 	lastConnected time.Time
 	lastError     error
+	interfaceName string
 
-	conn       gnm.Connection
-	activeConn gnm.ActiveConnection
+	conn gnm.Connection
 }
 
 func (n *network) getInfo() provisioning.NetworkInfo {

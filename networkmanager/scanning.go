@@ -17,21 +17,26 @@ func (w *NMWrapper) NetworkScan(ctx context.Context) error {
 	w.opMu.Lock()
 	defer w.opMu.Unlock()
 
-	prevScan, err := w.dev.GetPropertyLastScan()
+	wifiDev, ok := w.wifiDevices[w.hotspotInterface]
+	if !ok {
+		return errw.Errorf("cannot find hotspot interface: %s", w.hotspotInterface)
+	}
+
+	prevScan, err := wifiDev.GetPropertyLastScan()
 	if err != nil {
 		return errw.Wrap(err, "error scanning wifi")
 	}
 
-	err = w.dev.RequestScan()
+	err = wifiDev.RequestScan()
 	if err != nil {
-		return errw.Wrap(err, "error scanning wifi")
+		return errw.Wrap(err, "scanning wifi")
 	}
 
 	var lastScan int64
 	for {
-		lastScan, err = w.dev.GetPropertyLastScan()
+		lastScan, err = wifiDev.GetPropertyLastScan()
 		if err != nil {
-			return errw.Wrap(err, "error scanning wifi")
+			return errw.Wrap(err, "scanning wifi")
 		}
 		if lastScan > prevScan {
 			break
@@ -41,9 +46,9 @@ func (w *NMWrapper) NetworkScan(ctx context.Context) error {
 		}
 	}
 
-	wifiList, err := w.dev.GetAccessPoints()
+	wifiList, err := wifiDev.GetAccessPoints()
 	if err != nil {
-		return errw.Wrap(err, "error scanning wifi")
+		return errw.Wrap(err, "scanning wifi")
 	}
 
 	w.dataMu.Lock()
@@ -53,7 +58,6 @@ func (w *NMWrapper) NetworkScan(ctx context.Context) error {
 	now := time.Now()
 	for _, ap := range wifiList {
 		if ctx.Err() != nil {
-			//nolint:nilerr
 			return nil
 		}
 		ssid, err := ap.GetPropertySSID()
@@ -108,7 +112,6 @@ func (w *NMWrapper) NetworkScan(ctx context.Context) error {
 
 	for _, nw := range w.networks {
 		if ctx.Err() != nil {
-			//nolint:nilerr
 			return nil
 		}
 
@@ -159,7 +162,7 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 		return err
 	}
 
-	var highestPriority int32
+	highestPriority := make(map[string]int32)
 	for _, conn := range conns {
 		//nolint:nilerr
 		if ctx.Err() != nil {
@@ -170,21 +173,28 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 			return err
 		}
 
-		ssid := getSSIDFromSettings(settings)
-
-		if ssid == "" {
-			// wired ethernet or some other type of connection
+		netKey, ifName, netType := getKeyIfNameTypeFromSettings(settings)
+		if netKey == "" {
+			// unknown network type, or broken network
 			continue
 		}
 
+		_, ok := highestPriority[ifName]
+		if !ok {
+			highestPriority[ifName] = -999
+		}
+
 		// actually record the network
-		nw, ok := w.networks[ssid]
+		nw, ok := w.networks[netKey]
 		if !ok {
 			nw = &network{
-				netType: NetworkTypeWifi,
-				ssid:    ssid,
+				netType:       netType,
+				interfaceName: ifName,
 			}
-			w.networks[ssid] = nw
+			if netType == NetworkTypeWifi {
+				nw.ssid = getSSIDFromSettings(settings)
+			}
+			w.networks[netKey] = nw
 		}
 		nw.conn = conn
 		nw.priority = getPriorityFromSettings(settings)
@@ -192,9 +202,9 @@ func (w *NMWrapper) updateKnownConnections(ctx context.Context) error {
 		if nw.ssid == w.hotspotSSID {
 			nw.netType = NetworkTypeHotspot
 			nw.isHotspot = true
-		} else if nw.priority > highestPriority {
-			highestPriority = nw.priority
-			w.primarySSID = nw.ssid
+		} else if nw.priority > highestPriority[ifName] {
+			highestPriority[ifName] = nw.priority
+			w.primarySSID[ifName] = nw.ssid
 		}
 	}
 
@@ -249,4 +259,38 @@ func getSSIDFromSettings(settings gnm.ConnectionSettings) string {
 		return ""
 	}
 	return string(ssidBytes)
+}
+
+func getKeyIfNameTypeFromSettings(settings gnm.ConnectionSettings) (string, string, string) {
+	_, wired := settings["802-3-ethernet"]
+	_, wireless := settings["802-11-wireless"]
+	if !wired && !wireless {
+		return "", "", ""
+	}
+
+	ifName := "any"
+	conn, ok := settings["connection"]
+	if ok {
+		ifKey, ok := conn["interface-name"]
+		if ok {
+			name, ok := ifKey.(string)
+			if ok {
+				ifName = name
+			}
+		}
+	}
+
+	if wired {
+		return GenNetKey(ifName, ""), ifName, NetworkTypeWired
+	}
+
+	if wireless {
+		ssid := getSSIDFromSettings(settings)
+		if ssid == "" {
+			return "", "", ""
+		}
+		return GenNetKey(ifName, ssid), ifName, NetworkTypeWifi
+	}
+
+	return "", "", ""
 }

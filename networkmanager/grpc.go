@@ -53,7 +53,7 @@ func (w *NMWrapper) GetSmartMachineStatus(ctx context.Context,
 		Errors:                     w.errListAsStrings(),
 	}
 
-	lastNetwork, ok := w.networks[w.lastSSID]
+	lastNetwork, ok := w.networks[w.lastSSID[w.hotspotInterface]]
 	if ok {
 		lastNetworkInfo := lastNetwork.getInfo()
 		ret.LatestConnectionAttempt = provisioning.NetworkInfoToProto(&lastNetworkInfo)
@@ -82,8 +82,8 @@ func (w *NMWrapper) SetNetworkCredentials(ctx context.Context,
 	w.input.PSK = req.GetPsk()
 	w.inputReceived.Store(true)
 
-	if req.GetSsid() == w.lastSSID && w.lastSSID != "" {
-		lastNetwork, ok := w.networks[w.lastSSID]
+	if req.GetSsid() == w.lastSSID[w.hotspotInterface] && w.lastSSID[w.hotspotInterface] != "" {
+		lastNetwork, ok := w.networks[w.lastSSID[w.hotspotInterface]]
 		if ok {
 			lastNetwork.lastError = nil
 		}
@@ -135,7 +135,7 @@ func (w *NMWrapper) GetNetworkList(ctx context.Context,
 func (w *NMWrapper) errListAsStrings() []string {
 	errList := []string{}
 
-	lastNetwork, ok := w.networks[w.lastSSID]
+	lastNetwork, ok := w.networks[w.lastSSID[w.hotspotInterface]]
 
 	if ok && lastNetwork.lastError != nil {
 		errList = append(errList, fmt.Sprintf("SSID: %s: %s", lastNetwork.ssid, lastNetwork.lastError))
